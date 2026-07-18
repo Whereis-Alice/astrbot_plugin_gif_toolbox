@@ -1,6 +1,6 @@
 """CPU-bound image and animation operations for GIF Toolbox.
 
-Copyright (C) 2026 Huli3 and AstrBot Plugin Authors.
+Copyright (C) 2026 Whereis-Alice and AstrBot Plugin Authors.
 This file is a modified work based on shskjw/astrbot_plugin_gifcaijian and
 is licensed under the GNU Affero General Public License v3.0 or later.
 See LICENSE for the complete license text.

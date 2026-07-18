@@ -1,6 +1,6 @@
 """AstrBot GIF Toolbox plugin entry point.
 
-Copyright (C) 2026 Huli3 and AstrBot Plugin Authors.
+Copyright (C) 2026 Whereis-Alice and AstrBot Plugin Authors.
 Modified on 2026-07-18 from shskjw/astrbot_plugin_gifcaijian.
 This independent AGPL-3.0-or-later fork fixes source-image resolution for
 current AstrBot components and keeps the upstream GIF utility commands.
@@ -91,7 +91,7 @@ class RuntimeSettings:
         )
 
 
-@register(PLUGIN_ID, "Huli3 (fork of shskjw)", PLUGIN_DESC, PLUGIN_VERSION, FORK_REPO)
+@register(PLUGIN_ID, "Whereis-Alice (fork of shskjw)", PLUGIN_DESC, PLUGIN_VERSION, FORK_REPO)
 class GifToolboxPlugin(Star):
     """GIF utility commands with AstrBot 4.16+ image-source compatibility."""
 
