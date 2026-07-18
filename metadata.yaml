@@ -1,7 +1,7 @@
 name: astrbot_plugin_gif_toolbox
 display_name: GIF 工具箱（独立 Fork）
 desc: 修复图片来源下载兼容性的 GIF/APNG/WebP 工具箱，支持单图转 GIF、变速、合成、裁剪与分解。
-version: v2.0.0
+version: v2.0.1
 author: Whereis-Alice (fork of shskjw)
 repo: https://github.com/Whereis-Alice/astrbot_plugin_gif_toolbox
 upstream_repo: https://github.com/shskjw/astrbot_plugin_gifcaijian

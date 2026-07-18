@@ -42,7 +42,7 @@ from .media_ops import (
 
 
 PLUGIN_ID = "astrbot_plugin_gif_toolbox"
-PLUGIN_VERSION = "v2.0.0"
+PLUGIN_VERSION = "v2.0.1"
 PLUGIN_DESC = "独立 Fork 的 GIF/APNG/WebP 图片工具箱：可靠下载、变速、裁剪、合成与单图转 GIF"
 FORK_REPO = "https://github.com/Whereis-Alice/astrbot_plugin_gif_toolbox"
 UPSTREAM_REPO = "https://github.com/shskjw/astrbot_plugin_gifcaijian"

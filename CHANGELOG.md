@@ -1,5 +1,9 @@
 # 更新日志
 
+## v2.0.1 - 2026-07-18
+
+- 移除 Pillow 的小于 12 上限，使插件与 AstrBot 4.26.6 核心固定的 Pillow 12.2.0 兼容；安装时不会再触发核心依赖降级保护。
+
 ## v2.0.0 - 2026-07-18
 
 - 从 shskjw/astrbot_plugin_gifcaijian 建立独立 Fork，插件唯一名改为 astrbot_plugin_gif_toolbox，不会覆盖或跟随上游同名插件更新。
