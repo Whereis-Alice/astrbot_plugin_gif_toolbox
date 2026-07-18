@@ -1,1050 +1,850 @@
-import re
-import io
-import os
+"""AstrBot GIF Toolbox plugin entry point.
+
+Copyright (C) 2026 Huli3 and AstrBot Plugin Authors.
+Modified on 2026-07-18 from shskjw/astrbot_plugin_gifcaijian.
+This independent AGPL-3.0-or-later fork fixes source-image resolution for
+current AstrBot components and keeps the upstream GIF utility commands.
+See LICENSE for the complete license text.
+"""
+
+from __future__ import annotations
+
 import asyncio
-import aiohttp
+import base64
+import binascii
+import re
 import tempfile
-import urllib.parse
-from PIL import Image as PILImage, ImageSequence, ImageFilter, ImageOps, ImageEnhance
-from astrbot.api.event import filter
-from astrbot.api.all import *
-from astrbot.api import logger
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, AsyncIterator, Iterable
+from urllib.parse import unquote, urlparse
+
+import aiohttp
+
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, filter
 import astrbot.api.message_components as Comp
+from astrbot.api.star import Context, Star, register
 
-# 尝试导入 imageio
-try:
-    import imageio
-except ImportError:
-    imageio = None
-
-
-@register(
-    "astrbot_plugin_gifcaijian",
-    "shskjw",
-    "支持GIF/APNG/WebP转换、裁剪、本地图片转线稿及多图合成(终极稳定版)",
-    "1.4.2",
-    "https://github.com/shkjw/astrbot_plugin_gifcaijian",
+from .media_ops import (
+    MediaOperationError,
+    MediaOptions,
+    age_image,
+    change_gif_speed,
+    crop_grid,
+    decompose_animation,
+    image_to_line_art,
+    make_single_image_gif,
+    multi_image_to_gif,
+    sprite_sheet_to_animation,
+    video_to_animation,
 )
-class SpriteToGifPlugin(Star):
-    def __init__(self, context: Context, config: dict = None):
-        super().__init__(context)
-        self.cfg = config if config is not None else {}
 
-        if imageio is None:
-            logger.warning("插件[astrbot_plugin_gifcaijian]检测到缺少 imageio 库。请运行 pip install imageio[ffmpeg]")
 
-    # --- 核心工具：统一保存动画 ---
-    def _save_animation(self, output: io.BytesIO, frames: list, duration_ms: int, loop: int = 0):
-        fmt = self.cfg.get('output_format', 'GIF').upper()
-        if fmt == 'GIF':
-            frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], duration=duration_ms,
-                           loop=loop, optimize=True, disposal=2)
-        elif fmt == 'APNG':
-            frames[0].save(output, format='PNG', save_all=True, append_images=frames[1:], duration=duration_ms,
-                           loop=loop, optimize=True, default_image=True)
-        elif fmt == 'WEBP':
-            frames[0].save(output, format='WEBP', save_all=True, append_images=frames[1:], duration=duration_ms,
-                           loop=loop, method=3, quality=80)
+PLUGIN_ID = "astrbot_plugin_gif_toolbox"
+PLUGIN_VERSION = "v2.0.0"
+PLUGIN_DESC = "独立 Fork 的 GIF/APNG/WebP 图片工具箱：可靠下载、变速、裁剪、合成与单图转 GIF"
+FORK_REPO = "https://github.com/Whereis-Alice/astrbot_plugin_gif_toolbox"
+UPSTREAM_REPO = "https://github.com/shskjw/astrbot_plugin_gifcaijian"
+
+DEFAULT_MAX_INPUT_MB = 30.0
+DEFAULT_TIMEOUT_SECONDS = 60
+DEFAULT_MAX_OUTPUT_MB = 10.0
+DEFAULT_MAX_FORWARD_PARTS = 40
+DEFAULT_MAX_MULTI_IMAGES = 20
+
+
+@dataclass(frozen=True)
+class SourceCandidate:
+    """An image/video reference extracted from an AstrBot message component."""
+
+    reference: str
+    component: Any | None
+    origin: str
+
+
+@dataclass(frozen=True)
+class RuntimeSettings:
+    """Validated configuration values used by handlers."""
+
+    max_input_bytes: int
+    timeout_seconds: int
+    max_output_bytes: int
+    max_side: int
+    max_frames: int
+    gif_max_colors: int
+    default_output_format: str
+    max_video_duration: float
+    default_video_scale: float
+    default_video_fps: int
+    default_single_frame_duration_ms: int
+    single_image_frame_count: int
+    max_forward_parts: int
+    max_multi_images: int
+
+    def media_options(self) -> MediaOptions:
+        return MediaOptions(
+            max_side=self.max_side,
+            max_frames=self.max_frames,
+            gif_max_colors=self.gif_max_colors,
+            max_output_bytes=self.max_output_bytes,
+        )
+
+
+@register(PLUGIN_ID, "Huli3 (fork of shskjw)", PLUGIN_DESC, PLUGIN_VERSION, FORK_REPO)
+class GifToolboxPlugin(Star):
+    """GIF utility commands with AstrBot 4.16+ image-source compatibility."""
+
+    def __init__(self, context: Context, config: AstrBotConfig | dict[str, Any] | None = None) -> None:
+        super().__init__(context, config)
+        self.config = config or {}
+
+    async def initialize(self) -> None:
+        logger.info("[%s] initialized; upstream: %s", PLUGIN_ID, UPSTREAM_REPO)
+
+    async def terminate(self) -> None:
+        logger.info("[%s] terminated", PLUGIN_ID)
+
+    def _config_value(self, key: str, default: Any) -> Any:
+        getter = getattr(self.config, "get", None)
+        if callable(getter):
+            return getter(key, default)
+        return default
+
+    @staticmethod
+    def _as_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+        try:
+            result = int(value)
+        except (TypeError, ValueError):
+            result = default
+        return max(minimum, min(maximum, result))
+
+    @staticmethod
+    def _as_float(value: Any, default: float, minimum: float, maximum: float) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            result = default
+        return max(minimum, min(maximum, result))
+
+    def _settings(self) -> RuntimeSettings:
+        format_name = str(self._config_value("output_format", "GIF")).upper()
+        if format_name not in {"GIF", "APNG", "WEBP"}:
+            format_name = "GIF"
+        max_input_mb = self._as_float(
+            self._config_value("max_input_size_mb", DEFAULT_MAX_INPUT_MB),
+            DEFAULT_MAX_INPUT_MB,
+            1.0,
+            200.0,
+        )
+        max_output_mb = self._as_float(
+            self._config_value("max_output_size_mb", DEFAULT_MAX_OUTPUT_MB),
+            DEFAULT_MAX_OUTPUT_MB,
+            1.0,
+            100.0,
+        )
+        return RuntimeSettings(
+            max_input_bytes=round(max_input_mb * 1024 * 1024),
+            timeout_seconds=self._as_int(
+                self._config_value("download_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+                DEFAULT_TIMEOUT_SECONDS,
+                5,
+                300,
+            ),
+            max_output_bytes=round(max_output_mb * 1024 * 1024),
+            max_side=self._as_int(self._config_value("max_image_side", 1280), 1280, 64, 4096),
+            max_frames=self._as_int(self._config_value("max_frames", 160), 160, 2, 500),
+            gif_max_colors=self._as_int(
+                self._config_value("gif_max_colors", 256),
+                256,
+                2,
+                256,
+            ),
+            default_output_format=format_name,
+            max_video_duration=self._as_float(
+                self._config_value("max_gif_duration", 10.0),
+                10.0,
+                0.5,
+                120.0,
+            ),
+            default_video_scale=self._as_float(
+                self._config_value("default_scale", 0.3),
+                0.3,
+                0.1,
+                1.0,
+            ),
+            default_video_fps=self._as_int(
+                self._config_value("default_fps", 10),
+                10,
+                1,
+                60,
+            ),
+            default_single_frame_duration_ms=self._as_int(
+                self._config_value("single_image_gif_duration_ms", 500),
+                500,
+                20,
+                60_000,
+            ),
+            single_image_frame_count=self._as_int(
+                self._config_value("single_image_gif_frame_count", 2),
+                2,
+                2,
+                12,
+            ),
+            max_forward_parts=self._as_int(
+                self._config_value("max_forward_parts", DEFAULT_MAX_FORWARD_PARTS),
+                DEFAULT_MAX_FORWARD_PARTS,
+                1,
+                100,
+            ),
+            max_multi_images=self._as_int(
+                self._config_value("max_multi_images", DEFAULT_MAX_MULTI_IMAGES),
+                DEFAULT_MAX_MULTI_IMAGES,
+                1,
+                60,
+            ),
+        )
+
+    @staticmethod
+    def _message_chain(event: AstrMessageEvent) -> list[Any]:
+        getter = getattr(event, "get_messages", None)
+        if callable(getter):
+            messages = getter()
+            if isinstance(messages, list):
+                return messages
+        message_obj = getattr(event, "message_obj", None)
+        messages = getattr(message_obj, "message", [])
+        return messages if isinstance(messages, list) else []
+
+    def _walk_components(self, items: Iterable[Any]) -> Iterable[Any]:
+        """Yield nested message components, prioritising reply-chain attachments."""
+
+        for item in items:
+            if isinstance(item, Comp.Reply):
+                chain = getattr(item, "chain", None)
+                if isinstance(chain, list):
+                    yield from self._walk_components(chain)
+                continue
+            if isinstance(item, Comp.Nodes):
+                for node in getattr(item, "nodes", []) or []:
+                    content = getattr(node, "content", None)
+                    if isinstance(content, list):
+                        yield from self._walk_components(content)
+                continue
+            if isinstance(item, Comp.Node):
+                content = getattr(item, "content", None)
+                if isinstance(content, list):
+                    yield from self._walk_components(content)
+                continue
+            if isinstance(item, dict):
+                kind = str(item.get("type", "")).lower()
+                data = item.get("data")
+                if kind == "reply":
+                    chain = (data or {}).get("chain") if isinstance(data, dict) else item.get("chain")
+                    if isinstance(chain, list):
+                        yield from self._walk_components(chain)
+                    continue
+                if kind in {"node", "nodes"}:
+                    nested: list[Any] = []
+                    if isinstance(data, dict):
+                        nested.extend(value for key in ("content", "messages") if isinstance((value := data.get(key)), list))
+                    nested.extend(
+                        value for key in ("content", "messages", "chain") if isinstance((value := item.get(key)), list)
+                    )
+                    for children in nested:
+                        yield from self._walk_components(children)
+                    continue
+            yield item
+
+    @staticmethod
+    def _refs_from_component(item: Any, expected_type: str) -> list[str]:
+        """Return all plausible source fields from a component or adapter dictionary."""
+
+        refs: list[str] = []
+        if isinstance(item, dict):
+            kind = str(item.get("type", "")).lower()
+            if kind and kind != expected_type:
+                return refs
+            data = item.get("data")
+            data = data if isinstance(data, dict) else {}
+            containers = (data, item)
+            for container in containers:
+                for key in ("path", "file", "url"):
+                    value = container.get(key)
+                    if isinstance(value, str) and value.strip():
+                        refs.append(value.strip())
         else:
-            frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], duration=duration_ms,
-                           loop=loop, optimize=True, disposal=2)
+            component_type = getattr(getattr(item, "type", None), "value", getattr(item, "type", ""))
+            if component_type and str(component_type).lower() != expected_type:
+                return refs
+            for key in ("path", "file", "url"):
+                value = getattr(item, key, None)
+                if isinstance(value, str) and value.strip():
+                    refs.append(value.strip())
 
-    # --- 辅助方法: 获取单张图片URL (增强版) ---
-    def _get_image_url(self, event: AstrMessageEvent) -> str:
-        """获取目标图片URL：优先回复的图片 -> 当前消息的图片 -> At对象的头像"""
-        
-        # 1. 检查回复链
-        if hasattr(event.message_obj, "message"):
-            for seg in event.message_obj.message:
-                if isinstance(seg, Comp.Reply) and seg.chain:
-                    for item in seg.chain:
-                        if isinstance(item, Comp.Image) and item.url: 
-                            return item.url
-                        if isinstance(item, dict) and item.get('type') == 'image':
-                            return item.get('data', {}).get('url') or item.get('url') or item.get('file')
+        unique: list[str] = []
+        seen: set[str] = set()
+        for reference in refs:
+            if reference not in seen:
+                unique.append(reference)
+                seen.add(reference)
+        return unique
 
-        # 2. 检查当前消息中的图片
-        # 优先使用 AstrBot 提供的便捷方法
-        if hasattr(event, "get_images"):
-            images = event.get_images()
-            if images: return images[0].url
-            
-        # 再次手动检查 chain (防止便捷方法遗漏)
-        if hasattr(event.message_obj, "message"):
-            for seg in event.message_obj.message:
-                if isinstance(seg, Comp.Image) and seg.url:
-                    return seg.url
-                if isinstance(seg, dict) and seg.get('type') == 'image':
-                    return seg.get('data', {}).get('url') or seg.get('url') or seg.get('file')
+    def _collect_sources(self, event: AstrMessageEvent, expected_type: str) -> list[SourceCandidate]:
+        candidates: list[SourceCandidate] = []
+        seen: set[str] = set()
+        component_class = Comp.Image if expected_type == "image" else Comp.Video
+        for item in self._walk_components(self._message_chain(event)):
+            if not isinstance(item, (component_class, dict)):
+                continue
+            for reference in self._refs_from_component(item, expected_type):
+                if reference in seen:
+                    continue
+                seen.add(reference)
+                candidates.append(
+                    SourceCandidate(
+                        reference=reference,
+                        component=item if isinstance(item, component_class) else None,
+                        origin=expected_type,
+                    )
+                )
+        return candidates
 
-        # 3. 检查 At (获取头像)
-        if hasattr(event.message_obj, "message"):
-            for seg in event.message_obj.message:
-                if isinstance(seg, Comp.At):
-                    # 尝试排除机器人自己 (如果能获取到 self_id)
-                    # 此处假设用户 At 别人是为了获取头像
-                    user_id = str(seg.qq)
-                    return f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
+    @staticmethod
+    def _local_path_from_reference(reference: str) -> Path | None:
+        """Resolve an existing ordinary or file:// path without treating it as a URL."""
 
+        try:
+            plain_path = Path(reference)
+            if plain_path.is_file():
+                return plain_path
+        except OSError:
+            # Very long Base64 strings and malformed file identifiers are not
+            # filesystem paths; let their dedicated resolvers handle them.
+            pass
+        parsed = urlparse(reference)
+        if parsed.scheme.lower() != "file":
+            return None
+        raw_path = unquote(parsed.path)
+        if parsed.netloc and parsed.netloc not in {"", "localhost"}:
+            raw_path = f"//{parsed.netloc}{raw_path}"
+        if re.match(r"^/[A-Za-z]:[\\/]", raw_path):
+            raw_path = raw_path[1:]
+        path = Path(raw_path)
+        return path if path.is_file() else None
+
+    @staticmethod
+    def _decode_inline_data(reference: str, size_limit: int) -> bytes | None:
+        payload = ""
+        if reference.startswith("base64://"):
+            payload = reference.removeprefix("base64://")
+        elif reference.startswith("data:") and ";base64," in reference:
+            payload = reference.split(";base64,", 1)[1]
+        if not payload:
+            return None
+        try:
+            decoded = base64.b64decode(payload, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise MediaOperationError("图片 Base64 数据无效") from exc
+        if len(decoded) > size_limit:
+            raise MediaOperationError("图片超过插件配置的输入体积限制")
+        return decoded
+
+    async def _download_http(self, reference: str, settings: RuntimeSettings) -> bytes:
+        timeout = aiohttp.ClientTimeout(total=settings.timeout_seconds)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; AstrBot GIF Toolbox)",
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        }
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.get(reference, headers=headers, allow_redirects=True) as response:
+                    if response.status < 200 or response.status >= 300:
+                        raise MediaOperationError(f"图片下载失败（HTTP {response.status}）")
+                    content_length = response.content_length
+                    if content_length is not None and content_length > settings.max_input_bytes:
+                        raise MediaOperationError("图片超过插件配置的输入体积限制")
+                    content = bytearray()
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        content.extend(chunk)
+                        if len(content) > settings.max_input_bytes:
+                            raise MediaOperationError("图片超过插件配置的输入体积限制")
+                    if not content:
+                        raise MediaOperationError("图片下载结果为空")
+                    return bytes(content)
+        except MediaOperationError:
+            raise
+        except asyncio.TimeoutError as exc:
+            raise MediaOperationError("图片下载超时") from exc
+        except aiohttp.ClientError as exc:
+            raise MediaOperationError("图片下载连接失败") from exc
+
+    async def _resolve_onebot_file(
+        self,
+        event: AstrMessageEvent,
+        file_id: str,
+        settings: RuntimeSettings,
+    ) -> bytes | None:
+        """Ask a OneBot-compatible adapter to expand a file ID when available."""
+
+        api = getattr(getattr(event, "bot", None), "api", None)
+        call_action = getattr(api, "call_action", None)
+        if not callable(call_action):
+            return None
+        try:
+            result = await call_action("get_file", file_id=file_id)
+        except Exception as exc:
+            logger.debug("[%s] adapter could not resolve file id %r: %s", PLUGIN_ID, file_id, exc)
+            return None
+        if not isinstance(result, dict):
+            return None
+        for key in ("path", "file", "url"):
+            expanded = result.get(key)
+            if not isinstance(expanded, str) or not expanded or expanded == file_id:
+                continue
+            try:
+                return await self._read_reference(event, expanded, settings, allow_file_id=False)
+            except MediaOperationError:
+                continue
         return None
 
-    # --- 新增: 递归提取所有图片 (支持合并转发、回复等) ---
-    def _extract_images_from_chain(self, chain: list) -> list[str]:
-        urls = []
-        for item in chain:
-            # 1. 直接是 Image 组件
-            if isinstance(item, Comp.Image) and item.url:
-                urls.append(item.url)
-            # 2. 字典格式
-            elif isinstance(item, dict):
-                if item.get('type') == 'image':
-                    url = item.get('data', {}).get('url') or item.get('url') or item.get('file')
-                    if url and isinstance(url, str) and url.startswith('http'):
-                        urls.append(url)
-                # 3. 嵌套节点 (Forward Node)
-                elif item.get('type') == 'node':
-                    content = item.get('data', {}).get('content') or item.get('content')
-                    if isinstance(content, list):
-                        urls.extend(self._extract_images_from_chain(content))
-            # 4. Reply 组件
-            elif isinstance(item, Comp.Reply) and item.chain:
-                urls.extend(self._extract_images_from_chain(item.chain))
-            # 5. Nodes 组件
-            elif isinstance(item, Comp.Nodes):
-                if item.nodes:
-                    for node in item.nodes:
-                        if isinstance(node.content, list):
-                            urls.extend(self._extract_images_from_chain(node.content))
-        return urls
+    async def _read_reference(
+        self,
+        event: AstrMessageEvent,
+        reference: str,
+        settings: RuntimeSettings,
+        *,
+        allow_file_id: bool = True,
+    ) -> bytes:
+        inline = self._decode_inline_data(reference, settings.max_input_bytes)
+        if inline is not None:
+            return inline
 
-    async def _get_all_image_urls(self, event: AstrMessageEvent) -> list[str]:
-        """获取上下文中所有的图片链接（包括当前消息、回复的消息、转发消息、At头像）"""
-        urls = []
-
-        # 1. 检查 event.message_obj.message
-        if hasattr(event.message_obj, "message") and isinstance(event.message_obj.message, list):
-            urls.extend(self._extract_images_from_chain(event.message_obj.message))
-
-        # 2. 补充 get_images
-        if hasattr(event, "get_images"):
-            imgs = event.get_images()
-            for img in imgs:
-                if img.url and img.url not in urls:
-                    urls.append(img.url)
-        
-        # 3. 补充 At 头像
-        if hasattr(event.message_obj, "message"):
-            for seg in event.message_obj.message:
-                if isinstance(seg, Comp.At):
-                    uid = str(seg.qq)
-                    url = f"https://q1.qlogo.cn/g?b=qq&nk={uid}&s=640"
-                    if url not in urls:
-                        urls.append(url)
-
-        # 去重但保持顺序
-        seen = set()
-        unique_urls = []
-        for u in urls:
-            if u not in seen:
-                unique_urls.append(u)
-                seen.add(u)
-        return unique_urls
-
-    # --- 辅助方法: 智能获取视频源 ---
-    def _get_video_source(self, event: AstrMessageEvent) -> str:
-        candidates = []
-
-        def extract_from_item(item):
-            url = getattr(item, 'url', None)
-            if not url and isinstance(item, dict):
-                url = item.get('data', {}).get('url') or item.get('url')
-            if url and isinstance(url, str) and url.startswith('http'):
-                return 100, url
-            path = getattr(item, 'path', None)
-            if not path and isinstance(item, dict):
-                path = item.get('data', {}).get('path') or item.get('path')
-            if path and isinstance(path, str) and os.path.isabs(path) and os.path.exists(path):
-                return 90, path
-            file_info = getattr(item, 'file', None)
-            if not file_info and isinstance(item, dict):
-                file_info = item.get('data', {}).get('file') or item.get('file')
-            if file_info and isinstance(file_info, str):
-                return 50, file_info
-            return 0, None
-
-        items_to_check = []
-        if hasattr(event, "get_videos"):
-            videos = event.get_videos()
-            if videos: items_to_check.extend(videos)
-
-        if hasattr(event.message_obj, "message"):
-            for seg in event.message_obj.message:
-                if isinstance(seg, Comp.Reply) and seg.chain:
-                    items_to_check.extend(seg.chain)
-                elif isinstance(seg, (Comp.Video, dict)):
-                    items_to_check.append(seg)
-                elif isinstance(seg, dict) and seg.get('type') == 'video':
-                    items_to_check.append(seg)
-
-        for item in items_to_check:
-            score, val = extract_from_item(item)
-            if val: candidates.append((score, val))
-
-        if not candidates: return None
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
-
-    # --- 通过API解析文件ID ---
-    async def _resolve_file_via_api(self, event: AstrMessageEvent, file_id: str) -> str:
-        try:
-            logger.info(f"尝试通过API解析文件ID: {file_id}")
-            res = await event.bot.api.call_action("get_file", file_id=file_id)
-            if not res or not isinstance(res, dict): return None
-            url = res.get('url')
-            if url and url.startswith('http'): return url
-            path = res.get('file')
-            if path and os.path.exists(path): return path
-            return url or path
-        except Exception as e:
-            logger.warning(f"API解析文件失败: {e}")
-            return None
-
-    # --- 智能参数解析 ---
-    def _parse_video_args(self, text: str):
-        default_scale = self.cfg.get('default_scale', 0.3)
-        default_fps = self.cfg.get('default_fps', 10)
-        params = {
-            'start': 0.0, 'end': None, 'fps': default_fps,
-            'step': 1, 'scale': default_scale, 'force_step': False
-        }
-        time_range = re.search(r'(\d+(?:\.\d+)?)[sS]?\s*[-~]\s*(\d+(?:\.\d+)?)[sS]?', text)
-        if time_range:
-            params['start'] = float(time_range.group(1))
-            params['end'] = float(time_range.group(2))
-            text = text.replace(time_range.group(0), " ")
-        else:
-            start_match = re.search(r'(?:开始|start)\s*(\d+(?:\.\d+)?)', text)
-            dur_match = re.search(r'(?:时长|len|time)\s*(\d+(?:\.\d+)?)', text)
-            if start_match: params['start'] = float(start_match.group(1))
-            if dur_match: params['end'] = params['start'] + float(dur_match.group(1))
-
-        step_match = re.search(r'(\d+)\s*/\s*(\d+)', text)
-        if step_match:
-            n1 = int(step_match.group(1))
-            n2 = int(step_match.group(2))
-            step_val = max(n1, n2)
-            if step_val > 0:
-                params['step'] = step_val
-                params['fps'] = None
-                params['force_step'] = True
-            text = text.replace(step_match.group(0), " ")
-        else:
-            fps_match = re.search(r'(?:fps|帧率)\s*(\d+)', text)
-            if fps_match: params['fps'] = int(fps_match.group(1))
-
-        scale_match = re.search(r'\b(0\.\d+|1\.0)\b', text)
-        if scale_match: params['scale'] = float(scale_match.group(1))
-        if params['scale'] < 0.1: params['scale'] = 0.1
-        if params['scale'] > 1.0: params['scale'] = 1.0
-        return params
-
-    # --- 核心处理逻辑 ---
-    def _process_gif_core(self, video_path: str, params: dict, max_colors: int = 256):
-        try:
-            reader = imageio.get_reader(video_path, format='FFMPEG')
-            meta = reader.get_meta_data()
-            video_duration = meta.get('duration', 100)
-            src_fps = meta.get('fps', 30) or 30
-            start_t = params['start']
-            end_t = params['end'] if params['end'] is not None else video_duration
-            max_dur_conf = self.cfg.get('max_gif_duration', 10.0)
-            warn_msg = ""
-            if (end_t - start_t) > max_dur_conf:
-                end_t = start_t + max_dur_conf
-                warn_msg = f"(限时{max_dur_conf}s)"
-            end_t = min(end_t, video_duration)
-            if start_t >= video_duration: return None, f"❌ 开始时间超限", 0
-
-            step = 1
-            target_fps = 0
-            if params.get('force_step'):
-                step = params['step']
-                target_fps = src_fps / step
-            elif params.get('fps'):
-                target_fps = params['fps']
-                if target_fps > src_fps: target_fps = src_fps
-                step = max(1, int(src_fps / target_fps))
-            else:
-                step = 3
-                target_fps = src_fps / step
-
-            frames = []
-            output_fmt = self.cfg.get('output_format', 'GIF').upper()
-            for i, frame in enumerate(reader):
-                current_time = i / src_fps
-                if current_time < start_t: continue
-                if current_time > end_t: break
-                if i % step == 0:
-                    pil_img = PILImage.fromarray(frame)
-                    w, h = pil_img.size
-                    new_w = int(w * params['scale'])
-                    new_h = int(h * params['scale'])
-                    pil_img = pil_img.resize((new_w, new_h), PILImage.Resampling.BILINEAR)
-                    if output_fmt == 'GIF' and max_colors < 256:
-                        pil_img = pil_img.quantize(colors=max_colors, method=1, dither=PILImage.Dither.FLOYDSTEINBERG)
-                    frames.append(pil_img)
-                if len(frames) > 400:
-                    warn_msg += " [帧数截断]"
-                    break
-            reader.close()
-            if not frames: return None, "❌ 无有效帧", 0
-            output = io.BytesIO()
-            duration_ms = int(1000 / target_fps) if target_fps > 0 else 100
-            self._save_animation(output, frames, duration_ms, loop=0)
-            output.seek(0)
-            size_mb = output.getbuffer().nbytes / 1024 / 1024
-            info = f"时间:{start_t}-{end_t:.1f}s {warn_msg}\n格式:{output_fmt} | FPS:{target_fps:.1f}\n缩放:{params['scale']} | 体积:{size_mb:.2f}MB"
-            return output, info, size_mb
-        except Exception as e:
-            return None, f"内部错误: {repr(e)}", 0
-
-    def _worker_video_to_gif_wrapper(self, video_path: str, params: dict):
-        if imageio is None: return "❌ 缺少依赖库 imageio", None
-        max_colors = self.cfg.get('gif_max_colors', 256)
-        gif_io, msg, size_mb = self._process_gif_core(video_path, params, max_colors)
-        if not gif_io: return msg, None
-        output_fmt = self.cfg.get('output_format', 'GIF').upper()
-        if size_mb > 10.0 and output_fmt == 'GIF':
-            new_params = params.copy()
-            new_msg_prefix = f"⚠️ 初次体积{size_mb:.1f}MB过大，自动压缩中...\n"
-            new_colors = 128 if max_colors > 128 else 64
-            new_params['scale'] = round(params['scale'] * 0.8, 2)
-            if new_params['scale'] < 0.1: new_params['scale'] = 0.1
-            retry_io, retry_msg, retry_size = self._process_gif_core(video_path, new_params, new_colors)
-            if retry_io and retry_size < size_mb:
-                return new_msg_prefix + retry_msg, retry_io
-            else:
-                return f"⚠️ 压缩失败({retry_size:.1f}MB)，原版:\n" + msg, gif_io
-        return "✅ 转换成功\n" + msg, gif_io
-
-    async def _download_content(self, url: str) -> bytes:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        async with aiohttp.ClientSession() as session:
+        path = self._local_path_from_reference(reference)
+        if path is not None:
             try:
-                async with session.get(url, headers=headers, timeout=60) as resp:
-                    if resp.status != 200: return None
-                    return await resp.read()
-            except:
-                return None
+                size = path.stat().st_size
+                if size > settings.max_input_bytes:
+                    raise MediaOperationError("图片超过插件配置的输入体积限制")
+                return await asyncio.to_thread(path.read_bytes)
+            except OSError as exc:
+                raise MediaOperationError("读取本地图片失败") from exc
 
-    def _worker_local_line_art(self, img_bytes: bytes) -> bytes:
-        """本地线稿生成算法"""
-        try:
-            # 1. 打开图片
-            img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+        parsed = urlparse(reference)
+        if parsed.scheme.lower() in {"http", "https"}:
+            return await self._download_http(reference, settings)
 
-            # 2. 转换为灰度
-            gray = img.convert("L")
+        if allow_file_id:
+            resolved = await self._resolve_onebot_file(event, reference, settings)
+            if resolved is not None:
+                return resolved
+        raise MediaOperationError("图片来源不是可访问的 URL、文件路径或 Base64 数据")
 
-            # 3. 边缘检测 (FIND_EDGES 效果类似素描)
-            edges = gray.filter(ImageFilter.FIND_EDGES)
-
-            # 4. 颜色反转 (黑底白线 -> 白底黑线)
-            result = ImageOps.invert(edges)
-
-            # 5. 增强对比度 (让线条更清晰)
-            enhancer = ImageEnhance.Contrast(result)
-            result = enhancer.enhance(3.0)  # 提高对比度
-
-            # 6. 保存
-            output = io.BytesIO()
-            result.save(output, format='JPEG', quality=90)
-            return output.getvalue()
-        except Exception as e:
-            return None
-
-    # --- 修复增强版: 本地图片转线稿 (无需API) ---
-    @filter.command("图片转线稿")
-    async def img_to_line_art(self, event: AstrMessageEvent):
-        img_url = self._get_image_url(event)
-        if not img_url:
-            yield event.plain_result("❌ 请发送图片或回复图片")
-            return
-
-        yield event.plain_result("⏳ 正在处理(本地模式)...")
-
-        # 1. 下载图片 (Bot自己下载，避免API防盗链问题)
-        img_bytes = await self._download_content(img_url)
-        if not img_bytes:
-            yield event.plain_result("❌ 图片下载失败 (Bot无法访问该图片链接)")
-            return
-
-        # 2. 本地算法处理
-        result_bytes = await asyncio.to_thread(self._worker_local_line_art, img_bytes)
-
-        if result_bytes:
-            yield event.chain_result([
-                Comp.Plain("✅ 转换成功"),
-                Comp.Image.fromBytes(result_bytes)
-            ])
-        else:
-            yield event.plain_result("❌ 转换处理失败 (图片格式错误?)")
-
-    @filter.command("视频转gif")
-    async def video_to_gif_cmd(self, event: AstrMessageEvent):
-        if imageio is None:
-            yield event.plain_result("❌ 无法使用此功能：服务器缺少 imageio 库。")
-            return
-        msg_text = event.message_str.replace("视频转gif", "")
-        params = self._parse_video_args(msg_text)
-        raw_source = self._get_video_source(event)
-        if not raw_source:
-            yield event.plain_result("❌ 请回复一个视频或发送视频链接。")
-            return
-        valid_source = None
-        if raw_source.startswith("http") or os.path.exists(raw_source):
-            valid_source = raw_source
-        else:
-            yield event.plain_result("⏳ 正在请求视频地址...")
-            valid_source = await self._resolve_file_via_api(event, raw_source)
-            if not valid_source:
-                yield event.plain_result(f"❌ 无法解析视频地址: {raw_source}")
-                return
-        fmt = self.cfg.get('output_format', 'GIF')
-        time_info = f"{params['start']}s-" + (f"{params['end']}s" if params['end'] else "末尾")
-        yield event.plain_result(f"⏳ 任务已接收 ({fmt})\n区间: {time_info}\n缩放: {params['scale']}")
-        tmp_path = ""
-        is_temp_file = False
-        try:
-            if valid_source.startswith("http"):
-                max_size = self.cfg.get('max_video_size_mb', 50.0) * 1024 * 1024
-                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
-                    tmp_path = tmp_file.name
-                    is_temp_file = True
-                headers = {"User-Agent": "Mozilla/5.0"}
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(valid_source, headers=headers, timeout=120) as resp:
-                        if resp.status != 200:
-                            yield event.plain_result(f"❌ 下载失败 HTTP {resp.status}")
-                            if os.path.exists(tmp_path): os.remove(tmp_path)
-                            return
-                        content_len = resp.headers.get('Content-Length')
-                        if content_len and int(content_len) > max_size:
-                            yield event.plain_result(f"❌ 视频超过大小限制")
-                            if os.path.exists(tmp_path): os.remove(tmp_path)
-                            return
-                        with open(tmp_path, 'wb') as f:
-                            f.write(await resp.read())
-            else:
-                tmp_path = valid_source
-                is_temp_file = False
-            result_msg, gif_bytes = await asyncio.to_thread(self._worker_video_to_gif_wrapper, tmp_path, params)
-            if is_temp_file and os.path.exists(tmp_path): os.remove(tmp_path)
-            if gif_bytes:
-                yield event.chain_result([Comp.Plain(result_msg), Comp.Image.fromBytes(gif_bytes.getvalue())])
-            else:
-                yield event.plain_result(result_msg)
-        except Exception as e:
-            if is_temp_file and tmp_path and os.path.exists(tmp_path): os.remove(tmp_path)
-            yield event.plain_result(f"❌ 处理异常: {repr(e)}")
-
-    # --- 其他功能保持 ---
-    def _parse_margins(self, text: str):
-        margins = {'top': 0, 'bottom': 0, 'left': 0, 'right': 0}
-        pattern = r'边距\s*([上下左右])?边?\s*(\d+)'
-        matches = re.findall(pattern, text)
-        for direction, amount_str in matches:
+    async def _load_image(self, event: AstrMessageEvent, settings: RuntimeSettings) -> bytes:
+        candidates = self._collect_sources(event, "image")
+        if not candidates:
+            raise MediaOperationError("未检测到图片。请直接发送图片或回复一条含图片的消息")
+        errors: list[str] = []
+        for candidate in candidates:
             try:
-                amount = int(amount_str)
-                if not direction:
-                    for k in margins: margins[k] += amount
-                elif direction == '上':
-                    margins['top'] += amount
-                elif direction == '下':
-                    margins['bottom'] += amount
-                elif direction == '左':
-                    margins['left'] += amount
-                elif direction == '右':
-                    margins['right'] += amount
-            except ValueError:
-                pass
-        clean_text = re.sub(pattern, " ", text)
-        return clean_text, margins
+                return await self._read_reference(event, candidate.reference, settings)
+            except MediaOperationError as exc:
+                errors.append(f"{candidate.reference[:80]!r}: {exc}")
+        logger.warning("[%s] no usable image source: %s", PLUGIN_ID, "; ".join(errors))
+        raise MediaOperationError("无法取得图片。请确认图片未过期，或直接重新发送原图")
 
-    def _crop_image_data(self, img_data: bytes, margins: dict) -> tuple[bytes, str]:
-        if all(v == 0 for v in margins.values()): return img_data, ""
-        try:
-            img = PILImage.open(io.BytesIO(img_data)).convert("RGBA")
-            w, h = img.size
-            l, u, r, d = margins['left'], margins['top'], w - margins['right'], h - margins['bottom']
-            if l >= r or u >= d: return img_data, f"\n⚠️ 边距无效: {w}x{h} -> {l},{u},{r},{d}"
-            output = io.BytesIO()
-            img.crop((l, u, r, d)).save(output, format='PNG')
-            return output.getvalue(), f"\n✂️ 已裁边距: 上{margins['top']} 下{margins['bottom']} 左{margins['left']} 右{margins['right']}"
-        except Exception as e:
-            return img_data, f"\n⚠️ 边距裁剪出错: {e}"
-
-    async def _download_image(self, url: str) -> bytes:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(url, headers=headers, timeout=30) as resp:
-                    if resp.status != 200: return None
-                    return await resp.read()
-            except:
-                return None
-
-    async def _handle_gif_task(self, event: AstrMessageEvent, algorithm_mode: int):
-        msg_text = event.message_str
-        clean_text, margins = self._parse_margins(msg_text)
-        clean_text = clean_text.replace("合成1gif", "").replace("合成2gif", "").replace("合成gif", "")
-        rows, cols, duration = 6, 6, 0.1
-        grid_match = re.search(r'(\d+)\s*[*x×]\s*(\d+)', clean_text)
-        if grid_match:
-            rows, cols = int(grid_match.group(1)), int(grid_match.group(2))
-            clean_text = clean_text.replace(grid_match.group(0), " ")
-        dur_match = re.search(r'(\d+(?:\.\d+)?)', clean_text)
-        if dur_match:
-            try:
-                val = float(dur_match.group(1))
-                if 0 < val <= 60: duration = val
-            except:
-                pass
-        img_url = self._get_image_url(event)
-        if not img_url:
-            yield event.plain_result("❌ 未检测到图片")
-            return
-        yield event.plain_result(f"⏳ 正在合成(算法{algorithm_mode})... ({rows}x{cols}, 每帧{duration}s)")
-        img_data = await self._download_image(img_url)
-        if not img_data:
-            yield event.plain_result("❌ 图片下载失败")
-            return
-        img_data, crop_msg = await asyncio.to_thread(self._crop_image_data, img_data, margins)
-        func = self.process_mode_1 if algorithm_mode == 1 else self.process_mode_2
-        res_msg, gif_bytes = await asyncio.to_thread(func, img_data, rows, cols, duration)
-        if gif_bytes:
-            yield event.chain_result([Comp.Plain(res_msg + crop_msg), Comp.Image.fromBytes(gif_bytes.getvalue())])
-        else:
-            yield event.plain_result(f"❌ 失败：\n{res_msg}")
-
-    @filter.command("合成1gif")
-    async def make_gif_v1(self, event: AstrMessageEvent):
-        async for res in self._handle_gif_task(event, 1): yield res
-
-    @filter.command("合成2gif")
-    async def make_gif_v2(self, event: AstrMessageEvent):
-        async for res in self._handle_gif_task(event, 2): yield res
-
-    def process_mode_1(self, img_data: bytes, rows: int, cols: int, duration_sec: float):
-        try:
-            img = PILImage.open(io.BytesIO(img_data))
-            if getattr(img, "is_animated", False): img.seek(0)
-            img = img.convert("RGBA")
-            w, h = img.size
-            cw, ch = w // cols, h // rows
-            if cw < 2 or ch < 2: return f"⚠️ 单格太小 ({cw}x{ch})", None
-            frames = []
-            for r in range(rows):
-                for c in range(cols):
-                    frames.append(img.crop((c * cw, r * ch, (c + 1) * cw, (r + 1) * ch)))
-            output = io.BytesIO()
-            self._save_animation(output, frames, int(duration_sec * 1000), loop=0)
-            output.seek(0)
-            return f"✅ 合成成功\n算法1 | {w}x{h} | {rows}行{cols}列", output
-        except Exception as e:
-            return f"逻辑异常: {e}", None
-
-    def process_mode_2(self, img_data: bytes, rows: int, cols: int, duration_sec: float):
-        try:
-            img = PILImage.open(io.BytesIO(img_data))
-            if getattr(img, "is_animated", False): img.seek(0)
-            img = img.convert("RGBA")
-            datas = img.getdata()
-            new_data = [(0, 0, 0, 0) if item[3] < 128 else (item[0], item[1], item[2], 255) for item in datas]
-            img.putdata(new_data)
-            has_trans = any(d[3] == 0 for d in new_data)
-            master_pal = img.convert("RGB").quantize(colors=255 if has_trans else 256, method=1)
-            w, h = img.size
-            cw, ch = w // cols, h // rows
-            if cw < 2 or ch < 2: return f"⚠️ 单格太小 ({cw}x{ch})", None
-            frames = []
-            for r in range(rows):
-                for c in range(cols):
-                    crop = img.crop((c * cw, r * ch, (c + 1) * cw, (r + 1) * ch))
-                    frame = crop.convert("RGB").quantize(palette=master_pal)
-                    if has_trans:
-                        mask = crop.split()[3].point(lambda a: 255 if a < 128 else 0)
-                        frame.paste(255, mask=mask)
-                    frames.append(frame)
-            output = io.BytesIO()
-            fmt = self.cfg.get('output_format', 'GIF').upper()
-            if fmt == 'GIF':
-                frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:],
-                               duration=int(duration_sec * 1000), loop=0, disposal=2,
-                               transparency=255 if has_trans else None, optimize=True)
+    async def _load_all_images(self, event: AstrMessageEvent, settings: RuntimeSettings) -> list[bytes]:
+        candidates = self._collect_sources(event, "image")[: settings.max_multi_images]
+        if not candidates:
+            raise MediaOperationError("未检测到图片。请直接发送图片或回复含图片的消息")
+        results = await asyncio.gather(
+            *(self._read_reference(event, candidate.reference, settings) for candidate in candidates),
+            return_exceptions=True,
+        )
+        images: list[bytes] = []
+        errors: list[str] = []
+        for candidate, result in zip(candidates, results, strict=True):
+            if isinstance(result, bytes):
+                images.append(result)
             else:
-                self._save_animation(output, frames, int(duration_sec * 1000), loop=0)
-            output.seek(0)
-            return f"✅ 合成成功\n算法2 | {w}x{h} | {rows}行{cols}列", output
-        except Exception as e:
-            return f"逻辑异常: {e}", None
+                errors.append(f"{candidate.reference[:80]!r}: {result}")
+        if not images:
+            logger.warning("[%s] all image downloads failed: %s", PLUGIN_ID, "; ".join(errors))
+            raise MediaOperationError("无法取得任何图片。请确认图片未过期，或直接重新发送原图")
+        if errors:
+            logger.info("[%s] skipped %d unavailable image source(s)", PLUGIN_ID, len(errors))
+        return images
 
-    # --- 统一变速处理逻辑 ---
-    async def _change_speed_impl(self, event: AstrMessageEvent, is_accelerate: bool):
-        msg = event.message_str
-        # 尝试从消息中提取倍数参数
-        factor = 2.0
-        # 匹配浮点数，忽略可能存在的文字干扰
-        num_match = re.search(r"(\d+\.?\d*)", msg)
-        if num_match:
-            factor = float(num_match.group(1))
-        
-        factor = max(0.1, min(factor, 20.0))
-        ratio = 1 / factor if is_accelerate else factor
-        action_name = "加速" if is_accelerate else "减速"
+    async def _load_video_path(self, event: AstrMessageEvent, settings: RuntimeSettings) -> tuple[Path, bool]:
+        candidates = self._collect_sources(event, "video")
+        if not candidates:
+            raise MediaOperationError("未检测到视频。请回复视频消息或与指令一起发送视频")
+        errors: list[str] = []
+        for candidate in candidates:
+            local_path = self._local_path_from_reference(candidate.reference)
+            if local_path is not None:
+                if local_path.stat().st_size > settings.max_input_bytes:
+                    raise MediaOperationError("视频超过插件配置的输入体积限制")
+                return local_path, False
+            try:
+                content = await self._read_reference(event, candidate.reference, settings)
+            except MediaOperationError as exc:
+                errors.append(f"{candidate.reference[:80]!r}: {exc}")
+                continue
+            suffix = Path(urlparse(candidate.reference).path).suffix or ".mp4"
+            handle = tempfile.NamedTemporaryFile(prefix=f"{PLUGIN_ID}_", suffix=suffix, delete=False)
+            path = Path(handle.name)
+            try:
+                handle.write(content)
+                handle.close()
+                return path, True
+            except OSError:
+                handle.close()
+                path.unlink(missing_ok=True)
+                raise MediaOperationError("保存临时视频文件失败")
+        logger.warning("[%s] no usable video source: %s", PLUGIN_ID, "; ".join(errors))
+        raise MediaOperationError("无法取得视频。请确认视频未过期后重试")
 
-        img_url = self._get_image_url(event)
-        if not img_url: return
+    @staticmethod
+    def _parse_factor(text: str, default: float = 2.0) -> float:
+        match = re.search(r"(\d+(?:\.\d+)?)", text)
+        if not match:
+            return default
+        return max(0.1, min(20.0, float(match.group(1))))
 
-        yield event.plain_result(f"⏳ 正在处理 {action_name} {factor}倍...")
-        img_data = await self._download_image(img_url)
-        if not img_data:
-            yield event.plain_result("❌ 下载失败")
-            return
+    @staticmethod
+    def _parse_grid(text: str, default: tuple[int, int] = (6, 6)) -> tuple[int, int]:
+        match = re.search(r"(\d+)\s*[*x×]\s*(\d+)", text, re.IGNORECASE)
+        if not match:
+            return default
+        return int(match.group(1)), int(match.group(2))
 
-        res_msg, gif_bytes = await asyncio.to_thread(self.process_speed, img_data, ratio)
-        if gif_bytes:
-            yield event.chain_result([Comp.Plain(res_msg), Comp.Image.fromBytes(gif_bytes.getvalue())])
-        else:
-            yield event.plain_result(f"❌ 失败：{res_msg}")
+    @staticmethod
+    def _parse_margins(text: str) -> tuple[int, int, int, int]:
+        values = {"top": 0, "bottom": 0, "left": 0, "right": 0}
+        aliases = {"上": "top", "下": "bottom", "左": "left", "右": "right"}
+        for direction, number in re.findall(r"([上下左右])?\s*边距\s*(\d+)", text):
+            amount = min(10_000, int(number))
+            if direction:
+                values[aliases[direction]] = amount
+            else:
+                values = {key: amount for key in values}
+        return values["left"], values["top"], values["right"], values["bottom"]
+
+    @staticmethod
+    def _parse_duration_ms(text: str, default_ms: int) -> int:
+        fps_match = re.search(r"(\d+(?:\.\d+)?)\s*fps\b", text, re.IGNORECASE)
+        if fps_match:
+            fps = float(fps_match.group(1))
+            return round(1000 / max(0.1, min(60.0, fps)))
+        seconds_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:秒|s)\b", text, re.IGNORECASE)
+        if seconds_match:
+            return max(20, min(60_000, round(float(seconds_match.group(1)) * 1000)))
+        decimal_match = re.search(r"\b(0?\.\d+|\d+\.\d+)\b", text)
+        if decimal_match:
+            return max(20, min(60_000, round(float(decimal_match.group(1)) * 1000)))
+        return default_ms
+
+    @staticmethod
+    def _video_options(text: str, settings: RuntimeSettings) -> tuple[float, float | None, int, float]:
+        time_match = re.search(
+            r"(\d+(?:\.\d+)?)\s*(?:s|秒)?\s*[-~]\s*(\d+(?:\.\d+)?)\s*(?:s|秒)?",
+            text,
+            re.IGNORECASE,
+        )
+        start = float(time_match.group(1)) if time_match else 0.0
+        end = float(time_match.group(2)) if time_match else None
+        fps_match = re.search(r"(\d+)\s*fps\b", text, re.IGNORECASE)
+        fps = int(fps_match.group(1)) if fps_match else settings.default_video_fps
+        scale_match = re.search(r"\b(0\.\d+|1(?:\.0+)?)\b", text)
+        scale = float(scale_match.group(1)) if scale_match else settings.default_video_scale
+        return start, end, max(1, min(60, fps)), max(0.1, min(1.0, scale))
+
+    @staticmethod
+    def _image_result(event: AstrMessageEvent, text: str, data: bytes) -> Any:
+        return event.chain_result([Comp.Plain(text), Comp.Image.fromBytes(data)])
+
+    async def _change_speed(
+        self,
+        event: AstrMessageEvent,
+        processing_factor: float,
+        display_factor: float,
+        action: str,
+    ) -> AsyncIterator[Any]:
+        settings = self._settings()
+        yield event.plain_result(f"⏳ 正在处理 {action} {display_factor:g}倍...")
+        try:
+            source = await self._load_image(event, settings)
+            result, detail = await asyncio.to_thread(
+                change_gif_speed,
+                source,
+                processing_factor,
+                settings.media_options(),
+            )
+            suffix = "，已为控制体积自动压缩" if "自动压缩" in detail else ""
+            message = f"✅ GIF 已{action}至 {display_factor:g}倍{suffix}"
+            yield self._image_result(event, message, result)
+        except MediaOperationError as exc:
+            yield event.plain_result(f"❌ {exc}")
+        except Exception:
+            logger.exception("[%s] GIF speed processing failed", PLUGIN_ID)
+            yield event.plain_result("❌ GIF 处理失败，请稍后重试")
 
     @filter.command("加速")
-    @filter.regex(r"(?:gif)?(加速|变快)\s*[*x×]?\s*(\d+\.?\d*)?")
-    async def accelerate_gif(self, event: AstrMessageEvent):
-        async for res in self._change_speed_impl(event, True): yield res
+    @filter.regex(r"(?:gif)?(?:加速|变快)\s*[*x×]?\s*(\d+(?:\.\d+)?)?")
+    async def accelerate_gif(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """加速 GIF：回复动图后发送 加速 2。"""
+
+        factor = self._parse_factor(event.message_str)
+        async for result in self._change_speed(event, factor, factor, "加速"):
+            yield result
 
     @filter.command("减速")
-    @filter.regex(r"(?:gif)?(减速|变慢)\s*[*x×]?\s*(\d+\.?\d*)?")
-    async def decelerate_gif(self, event: AstrMessageEvent):
-        async for res in self._change_speed_impl(event, False): yield res
+    @filter.regex(r"(?:gif)?(?:减速|变慢)\s*[*x×]?\s*(\d+(?:\.\d+)?)?")
+    async def decelerate_gif(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """减速 GIF：回复动图后发送 减速 2。"""
 
-    def process_speed(self, img_data: bytes, ratio: float):
-        try:
-            img = PILImage.open(io.BytesIO(img_data))
-            if not getattr(img, "is_animated", False): return "这不是GIF", None
-            frames, durs = [], []
-            for frame in ImageSequence.Iterator(img):
-                durs.append(max(20, int(frame.info.get('duration', 100) * ratio)))
-                frames.append(frame.copy())
-            output = io.BytesIO()
-            frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:],
-                           duration=durs, loop=0, disposal=2, optimize=True)
-            output.seek(0)
-            return "✅ 变速完成", output
-        except Exception as e:
-            return f"异常: {e}", None
+        factor = self._parse_factor(event.message_str)
+        async for result in self._change_speed(event, 1 / factor, factor, "减速"):
+            yield result
 
-    def _worker_crop_grid(self, img_data: bytes, margins: dict, rows: int, cols: int):
-        img_data, crop_msg = self._crop_image_data(img_data, margins)
+    @filter.command("图片转gif", alias={"单图转gif"})
+    async def single_image_to_gif(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """将单张图片包装为 GIF：图片转gif 0.5s。"""
+
+        settings = self._settings()
+        duration = self._parse_duration_ms(event.message_str, settings.default_single_frame_duration_ms)
+        yield event.plain_result("⏳ 正在转换单张图片为 GIF...")
         try:
-            img = PILImage.open(io.BytesIO(img_data)).convert("RGBA")
-            w, h = img.size
-            cw, ch = w // cols, h // rows
-            if cw < 1 or ch < 1: return f"❌ 图片太小 {crop_msg}", None
-            res_list = []
-            for r in range(rows):
-                for c in range(cols):
-                    out = io.BytesIO()
-                    img.crop((c * cw, r * ch, (c + 1) * cw, (r + 1) * ch)).save(out, format='PNG')
-                    res_list.append(out.getvalue())
-            return crop_msg, res_list
-        except Exception as e:
-            return f"❌ 出错: {e}", None
+            source = await self._load_image(event, settings)
+            result, message = await asyncio.to_thread(
+                make_single_image_gif,
+                source,
+                duration,
+                settings.single_image_frame_count,
+                settings.media_options(),
+            )
+            yield self._image_result(event, message, result)
+        except MediaOperationError as exc:
+            yield event.plain_result(f"❌ {exc}")
+        except Exception:
+            logger.exception("[%s] single-image GIF conversion failed", PLUGIN_ID)
+            yield event.plain_result("❌ 图片转 GIF 失败，请稍后重试")
+
+    @filter.command("图片转线稿")
+    async def image_to_line_art(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """将图片转换为本地线稿。"""
+
+        settings = self._settings()
+        yield event.plain_result("⏳ 正在生成线稿...")
+        try:
+            result = await asyncio.to_thread(
+                image_to_line_art,
+                await self._load_image(event, settings),
+                settings.media_options(),
+            )
+            yield self._image_result(event, "✅ 线稿生成完成", result)
+        except MediaOperationError as exc:
+            yield event.plain_result(f"❌ {exc}")
+        except Exception:
+            logger.exception("[%s] line-art processing failed", PLUGIN_ID)
+            yield event.plain_result("❌ 线稿处理失败，请稍后重试")
+
+    async def _sprite_sheet(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        settings = self._settings()
+        rows, columns = self._parse_grid(event.message_str)
+        duration = self._parse_duration_ms(event.message_str, 100)
+        margins = self._parse_margins(event.message_str)
+        yield event.plain_result(
+            f"⏳ 正在按 {rows} 行 {columns} 列合成 GIF（每帧 {duration}ms）..."
+        )
+        try:
+            result, message = await asyncio.to_thread(
+                sprite_sheet_to_animation,
+                await self._load_image(event, settings),
+                rows,
+                columns,
+                duration,
+                settings.media_options(),
+                settings.default_output_format,
+                margins,
+            )
+            yield self._image_result(
+                event,
+                f"{message}（输出：{settings.default_output_format}）",
+                result,
+            )
+        except MediaOperationError as exc:
+            yield event.plain_result(f"❌ {exc}")
+        except Exception:
+            logger.exception("[%s] sprite-sheet processing failed", PLUGIN_ID)
+            yield event.plain_result("❌ 精灵图合成失败，请稍后重试")
+
+    @filter.command("合成1gif")
+    async def make_gif_v1(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """按行优先把精灵图合成为动画。"""
+
+        async for result in self._sprite_sheet(event):
+            yield result
+
+    @filter.command("合成2gif")
+    async def make_gif_v2(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """兼容旧指令的精灵图合成入口。"""
+
+        async for result in self._sprite_sheet(event):
+            yield result
+
+    @filter.command("多图合成gif")
+    async def multi_image_gif(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """将消息或回复中的多张图片合成为 GIF。"""
+
+        settings = self._settings()
+        duration = self._parse_duration_ms(event.message_str, 500)
+        yield event.plain_result("⏳ 正在下载图片并合成 GIF...")
+        try:
+            images = await self._load_all_images(event, settings)
+            result, message = await asyncio.to_thread(
+                multi_image_to_gif,
+                images,
+                duration,
+                settings.media_options(),
+            )
+            yield self._image_result(event, message, result)
+        except MediaOperationError as exc:
+            yield event.plain_result(f"❌ {exc}")
+        except Exception:
+            logger.exception("[%s] multi-image GIF processing failed", PLUGIN_ID)
+            yield event.plain_result("❌ 多图合成失败，请稍后重试")
 
     @filter.command("裁剪")
-    async def crop_and_forward(self, event: AstrMessageEvent):
-        clean, margins = self._parse_margins(event.message_str)
-        match = re.search(r'(\d+)\s*[*x×]\s*(\d+)', clean)
-        rows, cols = (int(match.group(1)), int(match.group(2))) if match else (1, 1)
-        if rows > 20 or cols > 20:
-            yield event.plain_result("⚠️ 行列数过大")
+    async def crop_and_forward(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """按网格裁剪图片：裁剪 2x3 边距 8。"""
+
+        settings = self._settings()
+        rows, columns = self._parse_grid(event.message_str, (1, 1))
+        if rows * columns > settings.max_forward_parts:
+            yield event.plain_result(f"❌ 分块数量不能超过 {settings.max_forward_parts}")
             return
-        img_url = self._get_image_url(event)
-        if not img_url:
-            yield event.plain_result("❌ 请发送图片")
-            return
-        yield event.plain_result("⏳ 处理中...")
-        img_data = await self._download_image(img_url)
-        if not img_data:
-            yield event.plain_result("❌ 下载失败")
-            return
-        msg, bytes_list = await asyncio.to_thread(self._worker_crop_grid, img_data, margins, rows, cols)
-        if not bytes_list:
-            yield event.plain_result(msg)
-            return
-        nodes = [Comp.Node(name="裁剪", content=[Comp.Plain(f"结果 {rows}x{cols}{msg}")])]
-        for b in bytes_list:
-            nodes.append(Comp.Node(name="裁剪", content=[Comp.Image.fromBytes(b)]))
-        yield event.chain_result([Comp.Nodes(nodes=nodes)])
+        yield event.plain_result(f"⏳ 正在裁剪为 {rows}×{columns}...")
+        try:
+            parts = await asyncio.to_thread(
+                crop_grid,
+                await self._load_image(event, settings),
+                rows,
+                columns,
+                self._parse_margins(event.message_str),
+                settings.max_forward_parts,
+            )
+            nodes = [
+                Comp.Node(
+                    name="GIF 工具箱",
+                    content=[Comp.Plain(f"裁剪结果 {index + 1}/{len(parts)}"), Comp.Image.fromBytes(part)],
+                )
+                for index, part in enumerate(parts)
+            ]
+            yield event.chain_result([Comp.Nodes(nodes=nodes)])
+        except MediaOperationError as exc:
+            yield event.plain_result(f"❌ {exc}")
+        except Exception:
+            logger.exception("[%s] crop processing failed", PLUGIN_ID)
+            yield event.plain_result("❌ 图片裁剪失败，请稍后重试")
 
     @filter.command("gif分解")
-    async def decompose_gif(self, event: AstrMessageEvent):
-        img_url = self._get_image_url(event)
-        if not img_url:
-            yield event.plain_result("❌ 请发送GIF")
-            return
-        yield event.plain_result("⏳ 分解中...")
-        img_data = await self._download_image(img_url)
-        frames = await asyncio.to_thread(self._worker_decompose, img_data)
-        if isinstance(frames, str):
-            yield event.plain_result(frames)
-            return
-        nodes = [Comp.Node(name="GIF助手", content=[Comp.Plain(f"第{i + 1}帧"), Comp.Image.fromBytes(b)]) for i, b in
-                 enumerate(frames)]
-        yield event.chain_result([Comp.Nodes(nodes=nodes)])
+    async def decompose_gif(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """将 GIF/APNG/WebP 动图分解为 PNG 帧。"""
 
-    def _worker_decompose(self, img_data: bytes):
+        settings = self._settings()
+        yield event.plain_result("⏳ 正在分解动画帧...")
         try:
-            img = PILImage.open(io.BytesIO(img_data))
-            if not getattr(img, "is_animated", False): return "⚠️ 不是GIF动画"
-            frames = []
-            for i, frame in enumerate(ImageSequence.Iterator(img)):
-                if i >= 100: break
-                out = io.BytesIO()
-                frame.copy().convert("RGBA").save(out, format='PNG')
-                frames.append(out.getvalue())
-            return frames
-        except Exception as e:
-            return f"❌ 出错: {e}"
-
-    # --- 新增: 多图合成 GIF 核心处理逻辑 ---
-    def _worker_multi_image_gif(self, images_bytes: list[bytes], duration_sec: float):
-        try:
-            pil_images = []
-            max_w, max_h = 0, 0
-
-            # 1. 加载所有图片并计算最大尺寸
-            for b in images_bytes:
-                try:
-                    img = PILImage.open(io.BytesIO(b)).convert("RGBA")
-                    # 如果是动态图，取第一帧
-                    if getattr(img, "is_animated", False):
-                        img.seek(0)
-                        img = img.copy()
-                    pil_images.append(img)
-                    max_w = max(max_w, img.width)
-                    max_h = max(max_h, img.height)
-                except Exception as e:
-                    logger.warning(f"加载图片失败: {e}")
-
-            if not pil_images:
-                return "❌ 没有有效的图片", None
-
-            frames = []
-            # 2. 统一尺寸：保持比例缩放，居中填充
-            for img in pil_images:
-                # 创建透明背景（如果合成JPG可以改为白色背景）
-                bg = PILImage.new("RGBA", (max_w, max_h), (255, 255, 255, 0))
-
-                # 计算缩放比例
-                src_ratio = img.width / img.height
-                tgt_ratio = max_w / max_h
-
-                if src_ratio > tgt_ratio:
-                    # 按照宽度缩放
-                    new_w = max_w
-                    new_h = int(max_w / src_ratio)
-                else:
-                    # 按照高度缩放
-                    new_h = max_h
-                    new_w = int(max_h * src_ratio)
-
-                # 缩放图片
-                img_resized = img.resize((new_w, new_h), PILImage.Resampling.BILINEAR)
-
-                # 居中粘贴
-                paste_x = (max_w - new_w) // 2
-                paste_y = (max_h - new_h) // 2
-                bg.paste(img_resized, (paste_x, paste_y), mask=img_resized if 'A' in img_resized.getbands() else None)
-
-                # 将透明部分处理为白色（对于GIF显示效果更好，或者保留透明）
-                # 这里为了通用性，如果输出GIF，Pillow会自动处理透明度。
-                # 如果希望背景是白色：
-                # final_frame = PILImage.new("RGB", (max_w, max_h), (255, 255, 255))
-                # final_frame.paste(bg, mask=bg.split()[3])
-                frames.append(bg)
-
-            # 3. 保存动画
-            output = io.BytesIO()
-            duration_ms = int(duration_sec * 1000)
-            self._save_animation(output, frames, duration_ms, loop=0)
-            output.seek(0)
-
-            return f"✅ 合成成功 ({len(frames)}张)", output
-
-        except Exception as e:
-            return f"合成出错: {repr(e)}", None
-
-    # --- 新增: 表情包做旧功能 (模拟早期互联网传播效果) ---
-    def _worker_age_meme(self, img_data: bytes, times: int) -> tuple[str, bytes]:
-        """
-        模拟早期互联网图片传播的做旧效果:
-        1. 绿色通道增强 (变绿)
-        2. 低质量JPEG反复压缩 (马赛克失真)
-        3. 模糊处理 (变糊)
-        4. 饱和度/对比度调整 (颜色脏化)
-        自动检测GIF并逐帧处理后重新合成
-        """
-        try:
-            img = PILImage.open(io.BytesIO(img_data))
-            
-            # 自动检测是否是动图 (GIF/APNG/WebP动图)
-            is_animated = getattr(img, "is_animated", False)
-            
-            if is_animated:
-                # === 处理动图: 分解 -> 逐帧做旧 -> 重新合成 ===
-                frames = []
-                durations = []
-                
-                # 获取所有帧
-                for frame in ImageSequence.Iterator(img):
-                    dur = frame.info.get('duration', 100)
-                    if dur <= 0:
-                        dur = 100
-                    durations.append(dur)
-                    # 复制帧并转换为RGB进行做旧处理
-                    frame_copy = frame.copy().convert("RGB")
-                    aged_frame = self._age_single_frame(frame_copy, times)
-                    # 转换回P模式以便GIF保存 (带调色板)
-                    frames.append(aged_frame)
-                
-                if not frames:
-                    return "❌ 无法读取动图帧", None
-                
-                # 将RGB帧转换为调色板模式以生成GIF
-                gif_frames = []
-                for f in frames:
-                    # 量化为256色
-                    p_frame = f.convert("P", palette=PILImage.Palette.ADAPTIVE, colors=256)
-                    gif_frames.append(p_frame)
-                
-                output = io.BytesIO()
-                gif_frames[0].save(
-                    output, 
-                    format='GIF', 
-                    save_all=True, 
-                    append_images=gif_frames[1:],
-                    duration=durations, 
-                    loop=0, 
-                    disposal=2, 
-                    optimize=False
+            frames = await asyncio.to_thread(
+                decompose_animation,
+                await self._load_image(event, settings),
+                settings.media_options(),
+            )
+            nodes = [
+                Comp.Node(
+                    name="GIF 工具箱",
+                    content=[Comp.Plain(f"第 {index + 1} 帧"), Comp.Image.fromBytes(frame)],
                 )
-                output.seek(0)
-                return f"✅ 做旧成功 (动图 {len(frames)}帧, {times}次传播)", output.getvalue()
-            else:
-                # === 静态图处理 ===
-                img = img.convert("RGB")
-                aged_img = self._age_single_frame(img, times)
-                
-                output = io.BytesIO()
-                # 最终以中低质量JPEG保存，增加"古早"感
-                final_quality = max(30, 70 - times * 3)
-                aged_img.save(output, format='JPEG', quality=final_quality)
-                return f"✅ 做旧成功 ({times}次传播, 质量{final_quality}%)", output.getvalue()
-                
-        except Exception as e:
-            import traceback
-            return f"❌ 处理失败: {repr(e)}\n{traceback.format_exc()}", None
-
-    def _age_single_frame(self, img: PILImage.Image, times: int) -> PILImage.Image:
-        """对单帧图片进行做旧处理 - 渐进式做旧"""
-        import random
-        
-        # 确保是RGB模式
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        
-        for i in range(times):
-            # === 1. 绿色通道偏移 (变绿) - 渐进式，不是每次都加 ===
-            # 只在特定轮次进行色彩偏移，让变化更加渐进
-            if i % 3 == 0:  # 每3次做一次色彩偏移
-                r, g, b = img.split()
-                
-                # 非常轻微的绿色增强 (每次只加1-2)
-                green_boost = random.randint(1, 2)
-                red_reduce = random.randint(0, 1)
-                blue_reduce = random.randint(0, 1)
-                
-                # 使用函数工厂避免闭包问题
-                def make_add_func(val):
-                    return lambda x: min(255, x + val)
-                def make_sub_func(val):
-                    return lambda x: max(0, x - val)
-                
-                g = g.point(make_add_func(green_boost))
-                if red_reduce > 0:
-                    r = r.point(make_sub_func(red_reduce))
-                if blue_reduce > 0:
-                    b = b.point(make_sub_func(blue_reduce))
-                
-                img = PILImage.merge("RGB", (r, g, b))
-            
-            # === 2. JPEG压缩失真 (核心做旧效果) ===
-            # 模拟多次保存/转发的压缩损失
-            # 质量从70逐渐降到25，变化更平缓
-            quality = max(25, 70 - i * 3)
-            temp_io = io.BytesIO()
-            img.save(temp_io, format='JPEG', quality=quality)
-            temp_io.seek(0)
-            img = PILImage.open(temp_io).convert("RGB")
-            
-            # === 3. 轻微模糊 (变糊) - 每3次做一次 ===
-            if i % 3 == 0:
-                blur_radius = 0.2 + (i // 3) * 0.1  # 非常轻微的模糊
-                img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-            
-            # === 4. 轻微锐化 (模拟过度锐化的"塑料感") - 偶尔做 ===
-            if i % 5 == 2:
-                img = img.filter(ImageFilter.SHARPEN)
-            
-            # === 5. 轻微降低饱和度 (颜色变脏) ===
-            # 变化更加平缓
-            if i % 2 == 0:
-                enhancer = ImageEnhance.Color(img)
-                saturation = max(0.85, 1.0 - 0.015)  # 每次只降1.5%
-                img = enhancer.enhance(saturation)
-            
-            # === 6. 轻微降低对比度 (变灰暗) ===
-            if i % 2 == 1:
-                enhancer = ImageEnhance.Contrast(img)
-                contrast = max(0.85, 1.0 - 0.01)  # 每次只降1%
-                img = enhancer.enhance(contrast)
-            
-            # === 7. 缩放再放大 (像素化) - 仅在高次数时 ===
-            if times >= 15 and i == times // 2:
-                w, h = img.size
-                if w > 50 and h > 50:
-                    small = img.resize((int(w * 0.8), int(h * 0.8)), PILImage.Resampling.BILINEAR)
-                    img = small.resize((w, h), PILImage.Resampling.BILINEAR)
-        
-        return img
+                for index, frame in enumerate(frames)
+            ]
+            yield event.chain_result([Comp.Nodes(nodes=nodes)])
+        except MediaOperationError as exc:
+            yield event.plain_result(f"❌ {exc}")
+        except Exception:
+            logger.exception("[%s] decomposition failed", PLUGIN_ID)
+            yield event.plain_result("❌ 动图分解失败，请稍后重试")
 
     @filter.command("表情包做旧")
     @filter.regex(r"(?:表情包?)?做旧\s*(\d+)?")
-    async def age_meme(self, event: AstrMessageEvent):
-        """
-        表情包做旧功能，模拟早期互联网图片传播效果
-        用法：表情包做旧 [次数]
-        示例：表情包做旧 10 (做旧10次，数字越大越绿越糊)
-        建议：1-5次轻度做旧，5-10次中度做旧，10-20次重度做旧
-        """
-        msg_text = event.message_str
-        
-        # 解析做旧次数
-        times = 5  # 默认5次
-        num_match = re.search(r'做旧\s*(\d+)', msg_text)
-        if num_match:
-            times = int(num_match.group(1))
-        else:
-            # 尝试匹配其他数字
-            num_match = re.search(r'(\d+)', msg_text)
-            if num_match:
-                times = int(num_match.group(1))
-        
-        # 限制范围
-        times = max(1, min(times, 50))  # 1-50次
-        
-        img_url = self._get_image_url(event)
-        if not img_url:
-            yield event.plain_result("❌ 请发送图片或回复图片\n用法: 表情包做旧 [次数]\n次数越大越绿越糊 (建议1-20)")
-            return
-        
-        # 根据次数给出提示
-        if times <= 5:
-            level = "轻度做旧 (微微泛绿)"
-        elif times <= 10:
-            level = "中度做旧 (明显发绿变糊)"
-        elif times <= 20:
-            level = "重度做旧 (经典老图风格)"
-        else:
-            level = "极限做旧 (赛博遗产级别)"
-        
-        yield event.plain_result(f"⏳ 正在做旧... ({times}次传播, {level})")
-        
-        img_data = await self._download_image(img_url)
-        if not img_data:
-            yield event.plain_result("❌ 图片下载失败")
-            return
-        
-        # 自动检测动图类型并处理
-        res_msg, result_bytes = await asyncio.to_thread(
-            self._worker_age_meme, img_data, times
-        )
-        
-        if result_bytes:
-            yield event.chain_result([
-                Comp.Plain(f"{res_msg}\n💡 {level}"),
-                Comp.Image.fromBytes(result_bytes)
-            ])
-        else:
-            yield event.plain_result(res_msg)
+    async def age_meme(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """模拟重复转发造成的做旧效果：表情包做旧 10。"""
 
-    @filter.command("多图合成gif")
-    async def multi_img_gif(self, event: AstrMessageEvent):
-        """
-        多图合成GIF，支持直接发送图片、回复含图消息、转发消息。
-        用法：多图合成gif [速度/时长]
-        示例：多图合成gif 0.5 (每帧0.5秒)
-        """
-        # 1. 解析参数 (每帧时长)
-        msg_text = event.message_str.replace("多图合成gif", "")
-        duration = 0.5  # 默认0.5秒
+        settings = self._settings()
+        match = re.search(r"做旧\s*(\d+)", event.message_str)
+        times = int(match.group(1)) if match else 5
+        times = max(1, min(50, times))
+        yield event.plain_result(f"⏳ 正在做旧（{times} 次）...")
+        try:
+            result, message = await asyncio.to_thread(
+                age_image,
+                await self._load_image(event, settings),
+                times,
+                settings.media_options(),
+            )
+            yield self._image_result(event, message, result)
+        except MediaOperationError as exc:
+            yield event.plain_result(f"❌ {exc}")
+        except Exception:
+            logger.exception("[%s] image-aging processing failed", PLUGIN_ID)
+            yield event.plain_result("❌ 表情包做旧失败，请稍后重试")
 
-        # 尝试匹配 fps (例如 10fps) -> 转为 duration
-        fps_match = re.search(r'(\d+)\s*(?:fps|帧)', msg_text, re.I)
-        if fps_match:
-            try:
-                fps = float(fps_match.group(1))
-                if fps > 0: duration = 1.0 / fps
-            except:
-                pass
-        else:
-            # 尝试匹配秒数 (例如 0.2)
-            sec_match = re.search(r'(\d+(?:\.\d+)?)', msg_text)
-            if sec_match:
+    @filter.command("视频转gif")
+    async def video_to_gif(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """转换视频片段：视频转gif 1s-4s fps 10 0.5。"""
+
+        settings = self._settings()
+        start, end, fps, scale = self._video_options(event.message_str, settings)
+        yield event.plain_result("⏳ 正在下载并转换视频...")
+        temporary = False
+        path: Path | None = None
+        try:
+            path, temporary = await self._load_video_path(event, settings)
+            result, message = await asyncio.to_thread(
+                video_to_animation,
+                path,
+                start,
+                end,
+                fps,
+                scale,
+                settings.media_options(),
+                settings.default_output_format,
+                settings.max_video_duration,
+            )
+            yield self._image_result(event, message, result)
+        except MediaOperationError as exc:
+            yield event.plain_result(f"❌ {exc}")
+        except Exception:
+            logger.exception("[%s] video conversion failed", PLUGIN_ID)
+            yield event.plain_result("❌ 视频转 GIF 失败，请稍后重试")
+        finally:
+            if temporary and path is not None:
                 try:
-                    val = float(sec_match.group(1))
-                    if 0.01 <= val <= 60: duration = val
-                except:
-                    pass
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("[%s] could not remove temporary video %s", PLUGIN_ID, path)
 
-        yield event.plain_result("⏳ 正在搜集图片资源...")
+    @filter.command("gif工具箱帮助")
+    async def gif_toolbox_help(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """显示 GIF 工具箱的主要命令和 AGPL 源码提示。"""
 
-        # 2. 获取所有图片链接
-        img_urls = await self._get_all_image_urls(event)
-
-        if not img_urls or len(img_urls) < 1:
-            yield event.plain_result("❌ 未检测到足够的图片资源 (请回复图片消息，或发送包含图片的合并转发)")
-            return
-
-        yield event.plain_result(f"⏳ 正在下载 {len(img_urls)} 张图片并合成 (每帧{duration:.2f}s)...")
-
-        # 3. 并发下载图片
-        tasks = [self._download_content(url) for url in img_urls]
-        results = await asyncio.gather(*tasks)
-        valid_bytes = [b for b in results if b is not None]
-
-        if len(valid_bytes) < 1:  # 允许单张图变成GIF (静止或只有一帧)
-            yield event.plain_result("❌ 图片下载失败")
-            return
-
-        # 4. 执行合成
-        res_msg, gif_io = await asyncio.to_thread(self._worker_multi_image_gif, valid_bytes, duration)
-
-        if gif_io:
-            yield event.chain_result([
-                Comp.Plain(f"{res_msg}\n画布适应最大尺寸，自动居中填充"),
-                Comp.Image.fromBytes(gif_io.getvalue())
-            ])
-        else:
-            yield event.plain_result(res_msg)
+        yield event.plain_result(
+            "GIF 工具箱命令：\n"
+            "• 图片转gif [0.5s]（别名：单图转gif）\n"
+            "• 加速 [倍数] / 减速 [倍数]（回复动图）\n"
+            "• 合成1gif / 合成2gif [6x6] [0.1s] [边距 8]\n"
+            "• 多图合成gif [0.5s]、裁剪 [2x3]、gif分解\n"
+            "• 图片转线稿、表情包做旧 [次数]、视频转gif [1s-4s fps 10 0.5]\n\n"
+            f"这是 {UPSTREAM_REPO} 的独立 AGPL-3.0-or-later Fork。"
+            "当前版本源码请向机器人管理员索取，管理员发布时应提供其 Fork 仓库。"
+        )

@@ -1,6 +1,12 @@
-name: astrbot_plugin_gifcaijian
-desc: 可以裁剪和合并gif 分解等功能（后续慢慢润化）
-help:  # 插件的帮助信息
-version: v1.4.2 # 插件版本号。格式：v1.1.1 或者 v1.1
-author: shskjw
-repo: https://github.com/shskjw/astrbot_plugin_gifcaijian
+name: astrbot_plugin_gif_toolbox
+display_name: GIF 工具箱（独立 Fork）
+desc: 修复图片来源下载兼容性的 GIF/APNG/WebP 工具箱，支持单图转 GIF、变速、合成、裁剪与分解。
+version: v2.0.0
+author: Huli3 (fork of shskjw)
+repo: https://github.com/Whereis-Alice/astrbot_plugin_gif_toolbox
+upstream_repo: https://github.com/shskjw/astrbot_plugin_gifcaijian
+astrbot_version: ">=4.16,<5"
+tags:
+  - gif
+  - image
+  - animation

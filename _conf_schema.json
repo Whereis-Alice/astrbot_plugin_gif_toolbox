@@ -1,33 +1,91 @@
 {
-  "max_video_size_mb": {
+  "max_input_size_mb": {
     "type": "float",
-    "description": "允许处理的视频最大体积(MB)",
-    "default": 50.0
+    "default": 30.0,
+    "description": "单个输入文件最大体积（MB）",
+    "hint": "同时限制本地文件、Base64 和远程下载，防止单条消息占用过多内存。"
   },
-  "max_gif_duration": {
-    "type": "float",
-    "description": "生成的动图最大允许时长(秒)",
-    "default": 10.0
-  },
-  "default_scale": {
-    "type": "float",
-    "description": "默认缩放比例(0.1-1.0)",
-    "default": 0.3
-  },
-  "default_fps": {
+  "download_timeout_seconds": {
     "type": "int",
-    "description": "默认帧率",
-    "default": 10
+    "default": 60,
+    "description": "远程图片/视频下载超时（秒）",
+    "hint": "范围会被限制在 5 到 300 秒。"
+  },
+  "max_output_size_mb": {
+    "type": "float",
+    "default": 10.0,
+    "description": "生成动图的目标最大体积（MB）",
+    "hint": "超过此大小时，插件会逐级缩放图片并减少 GIF 色彩。"
+  },
+  "max_image_side": {
+    "type": "int",
+    "default": 1280,
+    "description": "处理图片的最长边上限（像素）",
+    "hint": "较小的值可明显减少内存与输出体积。"
+  },
+  "max_frames": {
+    "type": "int",
+    "default": 160,
+    "description": "单次处理的最大动画帧数",
+    "hint": "动画帧超出上限时会均匀采样，范围为 2 到 500。"
   },
   "gif_max_colors": {
     "type": "int",
-    "description": "GIF最大颜色数量(2-256)，仅在输出格式为GIF时生效",
-    "default": 256
+    "default": 256,
+    "description": "GIF 最大调色板颜色数",
+    "hint": "范围为 2 到 256；颜色越少，体积通常越小。"
   },
   "output_format": {
     "type": "string",
-    "description": "输出格式：GIF (兼容性好), APNG (画质好透明度高), WEBP (体积最小)",
-    "enum": ["GIF", "APNG", "WEBP"],
-    "default": "GIF"
+    "default": "GIF",
+    "description": "视频转动画和精灵图合成的输出格式",
+    "options": [
+      "GIF",
+      "APNG",
+      "WEBP"
+    ],
+    "hint": "单图转 GIF、GIF 变速和多图合成始终输出 GIF。"
+  },
+  "max_gif_duration": {
+    "type": "float",
+    "default": 10.0,
+    "description": "视频转动画的最大截取时长（秒）",
+    "hint": "范围为 0.5 到 120 秒。"
+  },
+  "default_scale": {
+    "type": "float",
+    "default": 0.3,
+    "description": "视频转动画的默认缩放比例",
+    "hint": "范围为 0.1 到 1.0。"
+  },
+  "default_fps": {
+    "type": "int",
+    "default": 10,
+    "description": "视频转动画的默认帧率",
+    "hint": "范围为 1 到 60。"
+  },
+  "single_image_gif_duration_ms": {
+    "type": "int",
+    "default": 500,
+    "description": "单图转 GIF 的默认每帧时长（毫秒）",
+    "hint": "也可在命令后写 0.5s 或 2fps 覆盖。"
+  },
+  "single_image_gif_frame_count": {
+    "type": "int",
+    "default": 2,
+    "description": "单图转 GIF 生成的重复帧数",
+    "hint": "至少为 2，确保输出是实际 GIF 动画容器。"
+  },
+  "max_forward_parts": {
+    "type": "int",
+    "default": 40,
+    "description": "裁剪或分解时允许合并转发的最大图片数",
+    "hint": "范围为 1 到 100，避免一次发送过多消息段。"
+  },
+  "max_multi_images": {
+    "type": "int",
+    "default": 20,
+    "description": "多图合成 GIF 时最多读取的图片数",
+    "hint": "范围为 1 到 60；按消息链中的顺序取图。"
   }
 }
