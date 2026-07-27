@@ -200,12 +200,46 @@ class Event:
     def __init__(self, message: list[object], bot: object | None = None) -> None:
         self.message_obj = Message(message)
         self.bot = bot
+        self.stopped = False
 
     def get_messages(self) -> list[object]:
         return self.message_obj.message
 
+    def stop_event(self) -> None:
+        self.stopped = True
+
+    @staticmethod
+    def plain_result(text: str) -> str:
+        return text
+
 
 class SourceResolutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transform_handler_stops_later_matching_handlers(self) -> None:
+        plugin = GifToolboxPlugin(None, {})
+        event = Event([])
+        handler = plugin._apply_image_transform(event, "invert", "反色")
+
+        self.assertEqual(await anext(handler), "⏳ 正在处理反色...")
+        self.assertFalse(event.stopped)
+        self.assertTrue((await anext(handler)).startswith("❌ 未检测到图片"))
+        self.assertFalse(event.stopped)
+        with self.assertRaises(StopAsyncIteration):
+            await anext(handler)
+        self.assertTrue(event.stopped)
+
+    async def test_speed_handler_stops_later_matching_handlers(self) -> None:
+        plugin = GifToolboxPlugin(None, {})
+        event = Event([])
+        handler = plugin._change_speed(event, 2, 2, "调速")
+
+        self.assertEqual(await anext(handler), "⏳ 正在处理 调速 2倍...")
+        self.assertFalse(event.stopped)
+        self.assertTrue((await anext(handler)).startswith("❌ 未检测到图片"))
+        self.assertFalse(event.stopped)
+        with self.assertRaises(StopAsyncIteration):
+            await anext(handler)
+        self.assertTrue(event.stopped)
+
     async def test_at_avatar_fallback_is_limited_to_onebot_events(self) -> None:
         plugin = GifToolboxPlugin(None, {})
         message = [Comp.At(qq=2127074778)]

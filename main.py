@@ -45,7 +45,7 @@ from .media_ops import (
 
 
 PLUGIN_ID = "astrbot_plugin_gif_toolbox"
-PLUGIN_VERSION = "v2.1.0"
+PLUGIN_VERSION = "v2.1.1"
 PLUGIN_DESC = "独立 Fork 的 GIF/APNG/WebP 图片工具箱：可靠下载、变速、裁剪、合成、图像变换与单图转 GIF"
 FORK_REPO = "https://github.com/Whereis-Alice/astrbot_plugin_gif_toolbox"
 UPSTREAM_REPO = "https://github.com/shskjw/astrbot_plugin_gifcaijian"
@@ -657,6 +657,10 @@ class GifToolboxPlugin(Star):
         except Exception:
             logger.exception("[%s] GIF speed processing failed", PLUGIN_ID)
             yield event.plain_result("❌ GIF 处理失败，请稍后重试")
+        finally:
+            # Stop later matching handlers only after the final result has
+            # passed through AstrBot's response stages.
+            event.stop_event()
 
     @filter.command("加速")
     @filter.regex(r"(?:gif)?(?:加速|变快)\s*[*x×]?\s*(\d+(?:\.\d+)?)?")
@@ -676,7 +680,7 @@ class GifToolboxPlugin(Star):
         async for result in self._change_speed(event, 1 / factor, factor, "减速"):
             yield result
 
-    @filter.command("调速")
+    @filter.command("调速", priority=10)
     async def adjust_gif_speed(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         """按目标倍率调速 GIF：调速 2 表示两倍速。"""
 
@@ -708,64 +712,68 @@ class GifToolboxPlugin(Star):
         except Exception:
             logger.exception("[%s] image transform failed: %s", PLUGIN_ID, operation)
             yield event.plain_result(f"❌ {label}失败，请稍后重试")
+        finally:
+            # AstrBot otherwise runs every matching command handler. Delay the
+            # stop until the yielded final result has been sent.
+            event.stop_event()
 
-    @filter.command("反色")
+    @filter.command("反色", priority=10)
     async def invert_image(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         """反转静态图或 GIF/APNG/WebP 的 RGB 颜色。"""
 
         async for result in self._apply_image_transform(event, "invert", "反色"):
             yield result
 
-    @filter.command("顺时针")
+    @filter.command("顺时针", priority=10)
     async def rotate_clockwise(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         """将静态图或动图顺时针旋转 90 度。"""
 
         async for result in self._apply_image_transform(event, "rotate_clockwise", "顺时针旋转"):
             yield result
 
-    @filter.command("逆时针")
+    @filter.command("逆时针", priority=10)
     async def rotate_counterclockwise(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         """将静态图或动图逆时针旋转 90 度。"""
 
         async for result in self._apply_image_transform(event, "rotate_counterclockwise", "逆时针旋转"):
             yield result
 
-    @filter.command("左右翻转")
+    @filter.command("左右翻转", priority=10)
     async def flip_horizontal(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         """水平翻转静态图或 GIF/APNG/WebP。"""
 
         async for result in self._apply_image_transform(event, "flip_horizontal", "左右翻转"):
             yield result
 
-    @filter.command("上下翻转")
+    @filter.command("上下翻转", priority=10)
     async def flip_vertical(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         """垂直翻转静态图或 GIF/APNG/WebP。"""
 
         async for result in self._apply_image_transform(event, "flip_vertical", "上下翻转"):
             yield result
 
-    @filter.command("左对称")
+    @filter.command("左对称", priority=10)
     async def mirror_left(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         """保留左半边并镜像到右半边。"""
 
         async for result in self._apply_image_transform(event, "mirror_left", "左对称"):
             yield result
 
-    @filter.command("右对称")
+    @filter.command("右对称", priority=10)
     async def mirror_right(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         """保留右半边并镜像到左半边。"""
 
         async for result in self._apply_image_transform(event, "mirror_right", "右对称"):
             yield result
 
-    @filter.command("上对称")
+    @filter.command("上对称", priority=10)
     async def mirror_top(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         """保留上半边并镜像到下半边。"""
 
         async for result in self._apply_image_transform(event, "mirror_top", "上对称"):
             yield result
 
-    @filter.command("下对称")
+    @filter.command("下对称", priority=10)
     async def mirror_bottom(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         """保留下半边并镜像到上半边。"""
 
