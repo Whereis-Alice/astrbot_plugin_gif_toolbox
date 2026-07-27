@@ -4,6 +4,8 @@ Copyright (C) 2026 Whereis-Alice and AstrBot Plugin Authors.
 Modified on 2026-07-18 from shskjw/astrbot_plugin_gifcaijian.
 This independent AGPL-3.0-or-later fork fixes source-image resolution for
 current AstrBot components and keeps the upstream GIF utility commands.
+It also incorporates non-meme transform ideas from
+lirundong093-glitch/astrbot_plugin_pic_toolbox.
 See LICENSE for the complete license text.
 """
 
@@ -17,7 +19,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import aiohttp
 
@@ -37,15 +39,17 @@ from .media_ops import (
     make_single_image_gif,
     multi_image_to_gif,
     sprite_sheet_to_animation,
+    transform_image,
     video_to_animation,
 )
 
 
 PLUGIN_ID = "astrbot_plugin_gif_toolbox"
-PLUGIN_VERSION = "v2.0.1"
-PLUGIN_DESC = "独立 Fork 的 GIF/APNG/WebP 图片工具箱：可靠下载、变速、裁剪、合成与单图转 GIF"
+PLUGIN_VERSION = "v2.1.0"
+PLUGIN_DESC = "独立 Fork 的 GIF/APNG/WebP 图片工具箱：可靠下载、变速、裁剪、合成、图像变换与单图转 GIF"
 FORK_REPO = "https://github.com/Whereis-Alice/astrbot_plugin_gif_toolbox"
 UPSTREAM_REPO = "https://github.com/shskjw/astrbot_plugin_gifcaijian"
+PIC_TOOLBOX_REPO = "https://github.com/lirundong093-glitch/astrbot_plugin_pic_toolbox"
 
 DEFAULT_MAX_INPUT_MB = 30.0
 DEFAULT_TIMEOUT_SECONDS = 60
@@ -81,6 +85,8 @@ class RuntimeSettings:
     single_image_frame_count: int
     max_forward_parts: int
     max_multi_images: int
+    enable_at_avatar: bool
+    gif_speed_allow_frame_drop: bool
 
     def media_options(self) -> MediaOptions:
         return MediaOptions(
@@ -100,7 +106,12 @@ class GifToolboxPlugin(Star):
         self.config = config or {}
 
     async def initialize(self) -> None:
-        logger.info("[%s] initialized; upstream: %s", PLUGIN_ID, UPSTREAM_REPO)
+        logger.info(
+            "[%s] initialized; primary upstream: %s; transform reference: %s",
+            PLUGIN_ID,
+            UPSTREAM_REPO,
+            PIC_TOOLBOX_REPO,
+        )
 
     async def terminate(self) -> None:
         logger.info("[%s] terminated", PLUGIN_ID)
@@ -126,6 +137,18 @@ class GifToolboxPlugin(Star):
         except (TypeError, ValueError):
             result = default
         return max(minimum, min(maximum, result))
+
+    @staticmethod
+    def _as_bool(value: Any, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+        return default
 
     def _settings(self) -> RuntimeSettings:
         format_name = str(self._config_value("output_format", "GIF")).upper()
@@ -202,6 +225,14 @@ class GifToolboxPlugin(Star):
                 DEFAULT_MAX_MULTI_IMAGES,
                 1,
                 60,
+            ),
+            enable_at_avatar=self._as_bool(
+                self._config_value("enable_at_avatar", True),
+                True,
+            ),
+            gif_speed_allow_frame_drop=self._as_bool(
+                self._config_value("gif_speed_allow_frame_drop", False),
+                False,
             ),
         )
 
@@ -309,6 +340,40 @@ class GifToolboxPlugin(Star):
                     )
                 )
         return candidates
+
+    def _at_target_id(self, event: AstrMessageEvent) -> str | None:
+        """Return a numeric @ target suitable for the QQ avatar endpoint."""
+
+        for item in self._walk_components(self._message_chain(event)):
+            if isinstance(item, Comp.At):
+                containers = (item,)
+            elif isinstance(item, dict) and str(item.get("type", "")).lower() in {"at", "mention"}:
+                data = item.get("data")
+                containers = (data, item) if isinstance(data, dict) else (item,)
+            else:
+                continue
+            for container in containers:
+                for key in ("qq", "target", "user_id", "id"):
+                    value = container.get(key) if isinstance(container, dict) else getattr(container, key, None)
+                    target = str(value).strip() if value is not None else ""
+                    if target.isdecimal():
+                        return target
+        return None
+
+    def _at_avatar_candidate(self, event: AstrMessageEvent) -> SourceCandidate | None:
+        # The qlogo endpoint identifies users by QQ number. AstrBot's OneBot
+        # event exposes its adapter bot; do not accidentally treat numeric IDs
+        # from another platform as QQ accounts.
+        if getattr(event, "bot", None) is None:
+            return None
+        target = self._at_target_id(event)
+        if target is None:
+            return None
+        return SourceCandidate(
+            reference=f"https://q1.qlogo.cn/g?b=qq&nk={quote(target, safe='')}&s=640",
+            component=None,
+            origin="at-avatar",
+        )
 
     @staticmethod
     def _local_path_from_reference(reference: str) -> Path | None:
@@ -442,8 +507,12 @@ class GifToolboxPlugin(Star):
 
     async def _load_image(self, event: AstrMessageEvent, settings: RuntimeSettings) -> bytes:
         candidates = self._collect_sources(event, "image")
+        if not candidates and settings.enable_at_avatar:
+            avatar = self._at_avatar_candidate(event)
+            if avatar is not None:
+                candidates = [avatar]
         if not candidates:
-            raise MediaOperationError("未检测到图片。请直接发送图片或回复一条含图片的消息")
+            raise MediaOperationError("未检测到图片。请直接发送图片、回复含图片的消息，或 @ 一位 QQ 用户")
         errors: list[str] = []
         for candidate in candidates:
             try:
@@ -580,10 +649,9 @@ class GifToolboxPlugin(Star):
                 source,
                 processing_factor,
                 settings.media_options(),
+                settings.gif_speed_allow_frame_drop,
             )
-            suffix = "，已为控制体积自动压缩" if "自动压缩" in detail else ""
-            message = f"✅ GIF 已{action}至 {display_factor:g}倍{suffix}"
-            yield self._image_result(event, message, result)
+            yield self._image_result(event, detail, result)
         except MediaOperationError as exc:
             yield event.plain_result(f"❌ {exc}")
         except Exception:
@@ -606,6 +674,102 @@ class GifToolboxPlugin(Star):
 
         factor = self._parse_factor(event.message_str)
         async for result in self._change_speed(event, 1 / factor, factor, "减速"):
+            yield result
+
+    @filter.command("调速")
+    async def adjust_gif_speed(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """按目标倍率调速 GIF：调速 2 表示两倍速。"""
+
+        factor = self._parse_factor(event.message_str)
+        async for result in self._change_speed(event, factor, factor, "调速"):
+            yield result
+
+    async def _apply_image_transform(
+        self,
+        event: AstrMessageEvent,
+        operation: str,
+        label: str,
+    ) -> AsyncIterator[Any]:
+        """Load one image and apply an in-memory static/animated transform."""
+
+        settings = self._settings()
+        yield event.plain_result(f"⏳ 正在处理{label}...")
+        try:
+            source = await self._load_image(event, settings)
+            result, message = await asyncio.to_thread(
+                transform_image,
+                source,
+                operation,
+                settings.media_options(),
+            )
+            yield self._image_result(event, message, result)
+        except MediaOperationError as exc:
+            yield event.plain_result(f"❌ {exc}")
+        except Exception:
+            logger.exception("[%s] image transform failed: %s", PLUGIN_ID, operation)
+            yield event.plain_result(f"❌ {label}失败，请稍后重试")
+
+    @filter.command("反色")
+    async def invert_image(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """反转静态图或 GIF/APNG/WebP 的 RGB 颜色。"""
+
+        async for result in self._apply_image_transform(event, "invert", "反色"):
+            yield result
+
+    @filter.command("顺时针")
+    async def rotate_clockwise(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """将静态图或动图顺时针旋转 90 度。"""
+
+        async for result in self._apply_image_transform(event, "rotate_clockwise", "顺时针旋转"):
+            yield result
+
+    @filter.command("逆时针")
+    async def rotate_counterclockwise(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """将静态图或动图逆时针旋转 90 度。"""
+
+        async for result in self._apply_image_transform(event, "rotate_counterclockwise", "逆时针旋转"):
+            yield result
+
+    @filter.command("左右翻转")
+    async def flip_horizontal(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """水平翻转静态图或 GIF/APNG/WebP。"""
+
+        async for result in self._apply_image_transform(event, "flip_horizontal", "左右翻转"):
+            yield result
+
+    @filter.command("上下翻转")
+    async def flip_vertical(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """垂直翻转静态图或 GIF/APNG/WebP。"""
+
+        async for result in self._apply_image_transform(event, "flip_vertical", "上下翻转"):
+            yield result
+
+    @filter.command("左对称")
+    async def mirror_left(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """保留左半边并镜像到右半边。"""
+
+        async for result in self._apply_image_transform(event, "mirror_left", "左对称"):
+            yield result
+
+    @filter.command("右对称")
+    async def mirror_right(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """保留右半边并镜像到左半边。"""
+
+        async for result in self._apply_image_transform(event, "mirror_right", "右对称"):
+            yield result
+
+    @filter.command("上对称")
+    async def mirror_top(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """保留上半边并镜像到下半边。"""
+
+        async for result in self._apply_image_transform(event, "mirror_top", "上对称"):
+            yield result
+
+    @filter.command("下对称")
+    async def mirror_bottom(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """保留下半边并镜像到上半边。"""
+
+        async for result in self._apply_image_transform(event, "mirror_bottom", "下对称"):
             yield result
 
     @filter.command("图片转gif", alias={"单图转gif"})
@@ -841,10 +1005,13 @@ class GifToolboxPlugin(Star):
         yield event.plain_result(
             "GIF 工具箱命令：\n"
             "• 图片转gif [0.5s]（别名：单图转gif）\n"
-            "• 加速 [倍数] / 减速 [倍数]（回复动图）\n"
+            "• 加速 [倍数] / 减速 [倍数] / 调速 [倍率]（回复动图）\n"
+            "• 反色、顺时针、逆时针、左右翻转、上下翻转\n"
+            "• 左对称、右对称、上对称、下对称（均支持静态图和动图）\n"
             "• 合成1gif / 合成2gif [6x6] [0.1s] [边距 8]\n"
             "• 多图合成gif [0.5s]、裁剪 [2x3]、gif分解\n"
             "• 图片转线稿、表情包做旧 [次数]、视频转gif [1s-4s fps 10 0.5]\n\n"
-            f"这是 {UPSTREAM_REPO} 的独立 AGPL-3.0-or-later Fork。"
+            f"这是 {UPSTREAM_REPO} 的独立 AGPL-3.0-or-later Fork；"
+            f"图片变换功能参考了 {PIC_TOOLBOX_REPO}。"
             "当前版本源码请向机器人管理员索取，管理员发布时应提供其 Fork 仓库。"
         )

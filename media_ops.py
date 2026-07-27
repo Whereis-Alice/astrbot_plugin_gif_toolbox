@@ -2,7 +2,9 @@
 
 Copyright (C) 2026 Whereis-Alice and AstrBot Plugin Authors.
 This file is a modified work based on shskjw/astrbot_plugin_gifcaijian and
-is licensed under the GNU Affero General Public License v3.0 or later.
+includes non-meme transform functionality informed by
+lirundong093-glitch/astrbot_plugin_pic_toolbox. It is licensed under the
+GNU Affero General Public License v3.0 or later.
 See LICENSE for the complete license text.
 """
 
@@ -249,18 +251,150 @@ def encode_animation(
     return last_result, True
 
 
-def change_gif_speed(data: bytes, factor: float, options: MediaOptions) -> tuple[bytes, str]:
-    """Change GIF playback speed while retaining each source frame duration."""
+def change_gif_speed(
+    data: bytes,
+    factor: float,
+    options: MediaOptions,
+    allow_frame_drop: bool = False,
+) -> tuple[bytes, str]:
+    """Change GIF speed, optionally dropping frames once 20ms frame timing is reached."""
 
     if not 0.1 <= factor <= 20:
         raise MediaOperationError("倍速必须在 0.1 到 20 之间")
     frames, durations, animated = _animation_frames(data, options)
     if not animated:
         raise MediaOperationError("这不是 GIF/APNG/WebP 动图")
+
     adjusted = [max(20, round(duration / factor)) for duration in durations]
-    result, reduced = encode_animation(frames, adjusted, options, "GIF")
+    source_duration = sum(durations)
+    target_duration = source_duration / factor
+    selected_indices = list(range(len(frames)))
+
+    # A GIF frame cannot reliably use an interval below 20ms on common
+    # platforms. When enabled, retain evenly spaced frames until the encoded
+    # duration can approach the requested playback time without breaking that
+    # minimum interval.
+    if allow_frame_drop and sum(adjusted) > target_duration:
+        average_adjusted = sum(adjusted) / len(adjusted)
+        keep_count = max(1, min(len(frames), int(target_duration // average_adjusted)))
+        selected_indices = _sample_indices(len(frames), keep_count)
+        while len(selected_indices) > 1:
+            selected_duration = sum(adjusted[index] for index in selected_indices)
+            if selected_duration <= target_duration:
+                break
+            selected_indices = _sample_indices(len(frames), len(selected_indices) - 1)
+
+    selected_frames = [frames[index] for index in selected_indices]
+    selected_durations = [adjusted[index] for index in selected_indices]
+    result, reduced = encode_animation(selected_frames, selected_durations, options, "GIF")
+    output_duration = sum(selected_durations)
+    actual_factor = source_duration / output_duration if output_duration else factor
     suffix = "，已为控制体积自动压缩" if reduced else ""
+    if len(selected_indices) < len(frames):
+        return (
+            result,
+            (
+                "✅ GIF 已调速至 "
+                f"约 {actual_factor:g} 倍（为突破 20ms 帧间隔，已均匀丢弃 "
+                f"{len(frames) - len(selected_indices)} 帧）{suffix}"
+            ),
+        )
+    if actual_factor + 0.05 < factor:
+        return (
+            result,
+            f"✅ GIF 已调速至约 {actual_factor:g} 倍（受 20ms 最小帧间隔限制）{suffix}",
+        )
     return result, f"✅ GIF 已调整为 {factor:g} 倍速度{suffix}"
+
+
+def _invert_rgba(image: Image.Image) -> Image.Image:
+    red, green, blue, alpha = image.convert("RGBA").split()
+    inverted = ImageOps.invert(Image.merge("RGB", (red, green, blue)))
+    return Image.merge("RGBA", (*inverted.split(), alpha))
+
+
+def _mirror_half(image: Image.Image, keep: str) -> Image.Image:
+    """Mirror one half of an RGBA image while preserving odd-size centre pixels."""
+
+    image = image.convert("RGBA")
+    width, height = image.size
+    result = Image.new("RGBA", image.size)
+    if keep == "left":
+        half_width = (width + 1) // 2
+        half = image.crop((0, 0, half_width, height))
+        result.alpha_composite(half, (0, 0))
+        if width > 1:
+            mirrored = half.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+            result.alpha_composite(mirrored.crop((width % 2, 0, half_width, height)), (half_width, 0))
+    elif keep == "right":
+        half_width = (width + 1) // 2
+        x0 = width - half_width
+        half = image.crop((x0, 0, width, height))
+        if width > 1:
+            mirrored = half.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+            result.alpha_composite(mirrored.crop((0, 0, half_width - (width % 2), height)), (0, 0))
+        result.alpha_composite(half, (x0, 0))
+    elif keep == "top":
+        half_height = (height + 1) // 2
+        half = image.crop((0, 0, width, half_height))
+        result.alpha_composite(half, (0, 0))
+        if height > 1:
+            mirrored = half.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+            result.alpha_composite(mirrored.crop((0, height % 2, width, half_height)), (0, half_height))
+    elif keep == "bottom":
+        half_height = (height + 1) // 2
+        y0 = height - half_height
+        half = image.crop((0, y0, width, height))
+        if height > 1:
+            mirrored = half.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+            result.alpha_composite(mirrored.crop((0, 0, width, half_height - (height % 2))), (0, 0))
+        result.alpha_composite(half, (0, y0))
+    else:
+        raise MediaOperationError("不支持的对称方向")
+    return result
+
+
+def transform_image(data: bytes, operation: str, options: MediaOptions) -> tuple[bytes, str]:
+    """Apply a non-meme image transform to static or animated media."""
+
+    transforms = {
+        "invert": ("反色", _invert_rgba),
+        "flip_horizontal": (
+            "左右翻转",
+            lambda image: image.convert("RGBA").transpose(Image.Transpose.FLIP_LEFT_RIGHT),
+        ),
+        "flip_vertical": (
+            "上下翻转",
+            lambda image: image.convert("RGBA").transpose(Image.Transpose.FLIP_TOP_BOTTOM),
+        ),
+        "rotate_clockwise": (
+            "顺时针旋转",
+            lambda image: image.convert("RGBA").transpose(Image.Transpose.ROTATE_270),
+        ),
+        "rotate_counterclockwise": (
+            "逆时针旋转",
+            lambda image: image.convert("RGBA").transpose(Image.Transpose.ROTATE_90),
+        ),
+        "mirror_left": ("左对称", lambda image: _mirror_half(image, "left")),
+        "mirror_right": ("右对称", lambda image: _mirror_half(image, "right")),
+        "mirror_top": ("上对称", lambda image: _mirror_half(image, "top")),
+        "mirror_bottom": ("下对称", lambda image: _mirror_half(image, "bottom")),
+    }
+    try:
+        label, transform = transforms[operation]
+    except KeyError as exc:
+        raise MediaOperationError("不支持的图片变换") from exc
+
+    frames, durations, animated = _animation_frames(data, options)
+    transformed = [transform(frame) for frame in frames]
+    if animated:
+        result, reduced = encode_animation(transformed, durations, options, "GIF")
+        suffix = "，已为控制体积自动压缩" if reduced else ""
+        return result, f"✅ {label}完成（{len(transformed)} 帧）{suffix}"
+
+    output = io.BytesIO()
+    transformed[0].save(output, format="PNG")
+    return output.getvalue(), f"✅ {label}完成"
 
 
 def make_single_image_gif(

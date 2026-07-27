@@ -87,5 +87,17 @@
     "default": 20,
     "description": "多图合成 GIF 时最多读取的图片数",
     "hint": "范围为 1 到 60；按消息链中的顺序取图。"
+  },
+  "enable_at_avatar": {
+    "type": "bool",
+    "default": true,
+    "description": "允许 @ QQ 用户作为图片输入",
+    "hint": "没有直接图片或回复图片时，变换类命令会下载被 @ 用户的 QQ 头像；非 QQ 平台可关闭。"
+  },
+  "gif_speed_allow_frame_drop": {
+    "type": "bool",
+    "default": false,
+    "description": "GIF 调速允许均匀丢帧",
+    "hint": "关闭时保留全部帧，受 20ms 最小帧间隔限制；开启后可均匀丢帧以实现更高倍速。"
   }
 }
