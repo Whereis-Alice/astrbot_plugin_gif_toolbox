@@ -1,88 +1,285 @@
 # GIF 工具箱（独立 Fork）
 
-这是一个 AstrBot 图片与动图处理插件，基于上游
-[shskjw/astrbot_plugin_gifcaijian](https://github.com/shskjw/astrbot_plugin_gifcaijian)
-的功能方向重构而来。
+`astrbot_plugin_gif_toolbox` 是面向 AstrBot 的本地图片与动画处理插件，支持 GIF/APNG/WebP 变速、静态图转 GIF、基础图片变换、精灵图合成、裁剪、分解和视频转动画。
 
-v2.1.0 的通用图片变换与可选 GIF 丢帧调速参考了
-[lirundong093-glitch/astrbot_plugin_pic_toolbox](https://github.com/lirundong093-glitch/astrbot_plugin_pic_toolbox)。
-本插件只吸收其非表情包、非特效的图片处理能力；摸头、发射、杀、操你、抽你及其素材、OpenCV/numpy 依赖均未引入。
+这是 [shskjw/astrbot_plugin_gifcaijian](https://github.com/shskjw/astrbot_plugin_gifcaijian) 的独立 Fork。插件标识、数据目录和更新记录均使用 `astrbot_plugin_gif_toolbox`，因此可与上游插件同时安装，不会互相覆盖。
 
-本 Fork 的唯一插件标识为 astrbot_plugin_gif_toolbox，展示名为“GIF 工具箱（独立 Fork）”。
-它可以与上游 astrbot_plugin_gifcaijian 同时安装，不会覆盖上游目录、配置或插件更新记录。
+适用 AstrBot：`>=4.16,<5`。
 
-## 解决的问题
+## 快速开始
 
-上游在多数命令中把图片来源直接当作 HTTP URL 下载。当前 AstrBot 图片组件常把实际来源放在
-file 或 path 字段，也可能是 file:/// 本地缓存路径、base64:// 数据或 OneBot 文件 ID。
-这些情况会使 加速 2.0 等命令在显示“正在处理”后只返回“下载失败”。
+示例中的 `/` 是 AstrBot 常见的命令前缀。请替换成机器人实际配置的前缀；若你的 AstrBot 未启用前缀，则直接发送命令文本。
 
-本插件使用统一的来源解析顺序，支持：
+最稳定的使用方式是：先发送素材，再**回复该消息**发送命令。
 
-- 直接图片、回复图片、合并转发中的图片
-- 本地路径和 file:/// 缓存路径
-- base64://... 和 data:image/...;base64,... 
-- HTTP(S) 链接（含重定向、超时和流式体积限制）
-- OneBot 适配器可解析的文件 ID
-- 变换类命令在没有图片时可选用 `@QQ用户` 的头像作为回退来源
+```text
+回复一张图片：/图片转gif 0.5s
+回复一张动图：/加速 2
+回复一张图片：/左右翻转
+回复一段视频：/视频转gif 1s-4s fps 10 0.5
+```
 
-失败会写入带原因的插件日志，用户侧会得到可操作的提示，而不是静默吞掉异常。
+支持平台将图片或视频与命令放在同一条消息中时，也可以直接一起发送。
 
-## 功能与指令
+## 输入与参数规则
 
-| 指令 | 用法 | 说明 |
+### 素材怎么提供
+
+| 场景 | 可用方式 |
+| --- | --- |
+| 单张图片命令 | 直接附图、回复含图消息，或使用合并转发中的图片。找到多个来源时会使用第一个可读取的图片。 |
+| 多图合成 | 当前消息、被回复消息或合并转发中的图片会按消息顺序读取。 |
+| 视频转动画 | 直接附视频，或回复含视频的消息。 |
+| `@QQ用户` 头像 | 仅基础图片变换命令可用；需要 OneBot/QQ 适配器且 `enable_at_avatar=true`。没有附图时，`/反色 @某人` 一类命令会尝试使用其 QQ 头像。 |
+
+图片来源可为 AstrBot 缓存文件、`file:///` 路径、Base64 数据、HTTP(S) 链接或 OneBot 文件 ID。若提示素材无法取得，通常是原消息已过期；重新发送原图或原视频即可。
+
+### 命令写法
+
+| 写法 | 含义 |
+| --- | --- |
+| `[参数]` | 可选参数；省略时使用该命令或插件配置的默认值。 |
+| `行x列` | 网格尺寸；`x`、`*` 和 `×` 都可用，例如 `2x3`、`2*3`。 |
+| `时长` | 每一帧停留多久。可写 `0.5s`、`0.5秒`、`2fps`；无单位时只有小数写法（如 `0.5`）会被当作秒。`500ms` 和整数 `500` 不会被识别为时长，请改写为 `0.5s`。 |
+| `边距` | `边距 8` 同时裁掉四边各 8 像素；也可写 `上边距 8`、`下边距 8`、`左边距 8`、`右边距 8`。需要同时使用时，先写通用边距，再写单边覆盖值，例如 `边距 8 上边距 4`。 |
+
+图片合成、裁剪前的动画时长等需要填写的帧时长，必须在 **20ms 到 60000ms** 之间。其 `fps` 写法建议填写 **0.1 到 50fps**；50fps 对应 20ms 的最小可用帧间隔。视频命令的 `fps` 参数规则见后文。
+
+## 指令速查
+
+| 目标 | 指令示例 |
+| --- | --- |
+| 静态图转 GIF | `/图片转gif 0.5s` |
+| GIF 加速或减速 | `/加速 2`、`/减速 2`、`/调速 0.5` |
+| 反色、旋转、翻转、对称 | `/反色`、`/顺时针`、`/左对称` |
+| 精灵图切帧合成 | `/合成1gif 6x6 0.1s 边距 8` |
+| 多张图合成 GIF | `/多图合成gif 0.5s` |
+| 网格裁剪 | `/裁剪 2x3 边距 8` |
+| 拆出动画帧 | `/gif分解` |
+| 图片线稿或做旧 | `/图片转线稿`、`/表情包做旧 10` |
+| 视频片段转动画 | `/视频转gif 1s-4s fps 10 0.5` |
+| 查看内置速查 | `/gif工具箱帮助` |
+
+## 图片与动图
+
+### 图片转 GIF
+
+```text
+/图片转gif [时长]
+/单图转gif [时长]
+```
+
+`单图转gif` 是别名。命令会取输入图片的第一帧，生成至少两帧的真实 GIF 动画容器。
+
+| 参数 | 说明 |
+| --- | --- |
+| `时长` | 每帧时长。默认读取 `single_image_gif_duration_ms`，默认 `500ms`。可用 `0.5s`、`0.5秒`、`2fps` 或小数秒 `0.5`。 |
+
+示例：
+
+```text
+/图片转gif
+/图片转gif 1s
+/单图转gif 4fps
+```
+
+输出固定为 GIF。重复帧数量由 `single_image_gif_frame_count` 配置，默认 2 帧，可设为 2 到 12 帧。
+
+### GIF/APNG/WebP 变速
+
+```text
+/加速 [倍率]
+/减速 [倍率]
+/调速 [倍率]
+```
+
+仅接受 GIF、APNG 或 WebP 动图；静态图片会被拒绝。倍率省略时默认为 `2`，输入会限制在 `0.1` 到 `20`。
+
+| 指令 | 参数含义 | 示例结果 |
 | --- | --- | --- |
-| 图片转 GIF | 图片转gif 0.5s 或 单图转gif 2fps | 将单张静态图片转换为真实 GIF 容器。 |
-| GIF 变速 | 回复动图后发送 加速 2、减速 2 或 调速 2（倍率范围 0.1~20） | 默认保留全部帧并重新编码为 GIF；可开启配置通过均匀丢帧突破 20ms 最小帧间隔。 |
-| 基础变换 | 反色、顺时针、逆时针、左右翻转、上下翻转 | 静态图输出 PNG，GIF/APNG/WebP 输出 GIF；支持直接图片、回复图片或可选 `@QQ用户` 头像。 |
-| 对称变换 | 左对称、右对称、上对称、下对称 | 保留指定半边并镜像到另一侧，支持静态图与动图。 |
-| 精灵图合成 | 合成1gif 6x6 0.1s 边距 8 | 依次切分网格并合成为动画。合成2gif 作为旧指令兼容入口保留。 |
-| 多图合成 | 多图合成gif 0.5s | 将当前消息、回复或转发中的多张图片按顺序合成 GIF。 |
-| 网格裁剪 | 裁剪 2x3 边距 8 | 将图片切为合并转发的 PNG 小图。 |
-| 动图分解 | gif分解 | 将 GIF/APNG/WebP 动图分解为 PNG 帧。 |
-| 图片线稿 | 图片转线稿 | 本地边缘检测，不依赖外部 API。 |
-| 表情包做旧 | 表情包做旧 10 | 对静态图或动图模拟重复压缩转发效果。 |
-| 视频转动画 | 视频转gif 1s-4s fps 10 0.5 | 回复视频或随指令发送视频；依赖 imageio 的 FFmpeg 支持。 |
-| 帮助 | gif工具箱帮助 | 显示主要指令。 |
+| `/加速 N` | 以原速度的 `N` 倍播放。 | `/加速 2`：约两倍速。 |
+| `/调速 N` | 与加速相同，按目标倍率播放；`N<1` 可用于变慢。 | `/调速 0.5`：约半速。 |
+| `/减速 N` | 将每帧时长乘以 `N`，通常填写 `N>=1`。 | `/减速 2`：约半速。 |
 
-所有需要输入文件的命令都支持“直接发送图片/视频”或“回复包含文件的消息后发送指令”。
+GIF 在常见客户端上无法稳定使用低于 20ms 的帧间隔。因此在默认的 `gif_speed_allow_frame_drop=false` 下，较高倍率可能显示为“约 N 倍”，实际速度受 20ms 下限限制。开启该配置后，插件会均匀丢帧以更接近目标倍速，但中间画面会减少。
+
+### 基础图片变换
+
+下列命令均**不带参数**。可处理静态图片和 GIF/APNG/WebP 动图；静态图输出 PNG，动图输出 GIF。
+
+| 指令 | 效果 |
+| --- | --- |
+| `/反色` | 反转 RGB 颜色，保留透明度。 |
+| `/顺时针` | 顺时针旋转 90 度。 |
+| `/逆时针` | 逆时针旋转 90 度。 |
+| `/左右翻转` | 水平镜像。 |
+| `/上下翻转` | 垂直镜像。 |
+| `/左对称` | 保留左半边，并镜像填充右半边。 |
+| `/右对称` | 保留右半边，并镜像填充左半边。 |
+| `/上对称` | 保留上半边，并镜像填充下半边。 |
+| `/下对称` | 保留下半边，并镜像填充上半边。 |
+
+### 图片转线稿与做旧
+
+```text
+/图片转线稿
+/表情包做旧 [次数]
+```
+
+| 指令 | 参数与输出 |
+| --- | --- |
+| `/图片转线稿` | 无参数。本地边缘检测，不调用外部 API；动图只取第一帧，输出 JPEG。 |
+| `/表情包做旧 [次数]` | 模拟重复压缩转发。次数默认 `5`，有效范围 `1` 到 `50`，超出范围会截断。静态图输出 JPEG，动图逐帧处理后输出 GIF。 |
+
+## 合成、裁剪与分解
+
+### 精灵图合成动画
+
+```text
+/合成1gif [行x列] [时长] [边距]
+/合成2gif [行x列] [时长] [边距]
+```
+
+`合成2gif` 是保留的旧指令入口，与 `合成1gif` 行为相同。插件按从左到右、从上到下的顺序切出网格，再依次合成为动画。
+
+| 参数 | 默认值 | 范围与说明 |
+| --- | --- | --- |
+| `行x列` | `6x6` | 每个数为 `1` 到 `30`。网格总帧数超过 `max_frames` 时会均匀采样。 |
+| `时长` | `100ms` | 每帧时长，使用上文的时长写法。 |
+| `边距` | `0` | 非负像素值；边距和网格不能超过图片尺寸。 |
+
+示例：
+
+```text
+/合成1gif
+/合成1gif 4x6 0.12s
+/合成2gif 6x6 10fps 边距 8 上边距 4
+```
+
+输出格式取决于 `output_format` 配置，可选 GIF、APNG 或 WEBP。
+
+### 多图合成 GIF
+
+```text
+/多图合成gif [时长]
+```
+
+从当前消息、回复消息或合并转发中按顺序读取多张图片，每张图片成为一帧。默认每帧 `500ms`，时长写法与上文一致。默认最多读取 `20` 张图片，由 `max_multi_images` 控制；动图素材只使用其第一帧。输出固定为 GIF，尺寸不同的图片会居中到同一透明画布上。
+
+示例：
+
+```text
+/多图合成gif
+/多图合成gif 0.25s
+/多图合成gif 5fps
+```
+
+### 网格裁剪
+
+```text
+/裁剪 [行x列] [边距]
+```
+
+将一张图片切成网格后，以合并转发形式发送 PNG 小图。
+
+| 参数 | 默认值 | 范围与说明 |
+| --- | --- | --- |
+| `行x列` | `1x1` | 每个数为 `1` 到 `20`。分块总数不能超过 `max_forward_parts`，默认 `40`。 |
+| `边距` | `0` | 写法与精灵图合成相同，单位为像素。 |
+
+示例：
+
+```text
+/裁剪 2x3
+/裁剪 3x3 边距 12
+/裁剪 2x4 左边距 16 右边距 16
+```
+
+### 分解动图
+
+```text
+/gif分解
+```
+
+将 GIF、APNG 或 WebP 动图拆为 PNG 帧，并以合并转发发送。静态图片不支持。实际输出帧数受 `max_frames` 限制，默认最多 160 帧；原动图帧数更高时会均匀采样。
+
+## 视频转动画
+
+```text
+/视频转gif [开始时间-结束时间] [fps N] [缩放比例]
+```
+
+先直接附视频或回复视频消息。时间单位可以是 `s`、`秒` 或省略；`-` 和 `~` 都可用作时间范围分隔符。
+
+| 参数 | 默认值 | 范围与说明 |
+| --- | --- | --- |
+| `开始时间-结束时间` | 从 `0s` 开始 | 例如 `1s-4s`、`1.5秒~4秒`、`1-4`。要指定非零开始时间时，必须同时填写开始和结束时间；省略整个时间范围时从 `0s` 处理到视频结尾，但单次长度仍受 `max_gif_duration` 限制，默认 10 秒。 |
+| `fps N` | `default_fps`，默认 `10` | 目标帧率，`1` 到 `60`。原视频帧率更低时会使用原视频的较低帧率。 |
+| `缩放比例` | `default_scale`，默认 `0.3` | 直接写 `0.1` 到 `1.0` 的小数或 `1`；`0.5` 表示宽高各缩小到 50%。 |
+
+示例：
+
+```text
+/视频转gif
+/视频转gif 1s-4s
+/视频转gif 1s-4s fps 10 0.5
+/视频转gif 0-8秒 fps 15 1
+```
+
+输出格式由 `output_format` 决定，可选 GIF、APNG 或 WEBP。视频转换需要当前 AstrBot Python 环境可用 `imageio[ffmpeg]`；图片和 GIF 功能不依赖 FFmpeg。
+
+## 内置帮助
+
+```text
+/gif工具箱帮助
+```
+
+不带参数，返回机器人内的简短命令列表、Fork 来源与源码提示。完整的参数说明以本 README 为准。
+
+## 处理限制与配置
+
+在 AstrBot 插件配置面板可调整下列参数。范围以插件运行时实际限制为准。
+
+| 配置项 | 默认值 | 可设范围 | 作用 |
+| --- | ---: | --- | --- |
+| `max_input_size_mb` | 30 | 1 到 200 MB | 单个本地、Base64 或远程输入的最大体积。 |
+| `download_timeout_seconds` | 60 | 5 到 300 秒 | 远程图片/视频下载超时。 |
+| `max_output_size_mb` | 10 | 1 到 100 MB | 动画输出体积目标；超出时会尝试缩小尺寸和减少颜色，并非平台发送体积限制的替代品。 |
+| `max_image_side` | 1280 | 64 到 4096 px | 处理时图片最长边上限。 |
+| `max_frames` | 160 | 2 到 500 | 单次处理动画的最多帧数；超出会均匀采样。 |
+| `gif_max_colors` | 256 | 2 到 256 | GIF 最大调色板颜色数；降低可减小文件。 |
+| `output_format` | `GIF` | `GIF`、`APNG`、`WEBP` | 仅影响精灵图合成和视频转动画。 |
+| `max_gif_duration` | 10 秒 | 0.5 到 120 秒 | 视频转动画单次允许处理的最长片段。 |
+| `default_scale` | 0.3 | 0.1 到 1.0 | 视频转动画的默认缩放比例。 |
+| `default_fps` | 10 | 1 到 60 | 视频转动画的默认帧率。 |
+| `single_image_gif_duration_ms` | 500ms | 20 到 60000ms | 单图转 GIF 的默认每帧时长。 |
+| `single_image_gif_frame_count` | 2 | 2 到 12 | 单图转 GIF 的重复帧数。 |
+| `max_forward_parts` | 40 | 1 到 100 | 网格裁剪一次最多发送的分块数。 |
+| `max_multi_images` | 20 | 1 到 60 | 多图合成 GIF 一次最多读取的图片数。 |
+| `enable_at_avatar` | `true` | `true` / `false` | 允许基础图片变换在无图片时使用被 @ 的 QQ 用户头像。 |
+| `gif_speed_allow_frame_drop` | `false` | `true` / `false` | 允许 GIF 调速均匀丢帧，以接近超过 20ms 帧间隔限制的目标倍速。 |
 
 ## 安装
 
-1. 将本目录放进 AstrBot 的 data/plugins/astrbot_plugin_gif_toolbox。
-2. 在 AstrBot 的 Python 环境安装依赖：
+1. 在 AstrBot 插件安装页添加或安装 Fork 仓库：<https://github.com/Whereis-Alice/astrbot_plugin_gif_toolbox>。
+2. 手动安装时，将插件目录放入 `data/plugins/astrbot_plugin_gif_toolbox`。
+3. 让 AstrBot 安装插件依赖；若需要手动安装，请在 **AstrBot 使用的 Python 环境**执行：
 
-   ~~~powershell
+   ```powershell
    pip install -r data/plugins/astrbot_plugin_gif_toolbox/requirements.txt
-   ~~~
+   ```
 
-3. 重载插件或重启 AstrBot。
-4. 在插件配置面板调整输入/输出体积、最大帧数、视频默认参数等设置。
+4. 重载插件或重启 AstrBot，再发送 `/gif工具箱帮助` 查看内置速查。
 
-> 首次使用 视频转gif 前，请确认当前 Python 环境能使用 imageio[ffmpeg]。图片和 GIF 功能不依赖外部图床或 API。
->
-> 依赖声明兼容 AstrBot 4.26.6 的 Pillow 12.2.0；请让 AstrBot 管理其核心 Pillow 版本，不要手动降级它。
+依赖要求中使用 `Pillow>=10.3.0`，不限制 Pillow 小于 12，兼容 AstrBot 4.26.6 使用的 Pillow 12.2.0。请不要为了本插件手动降级 AstrBot 核心依赖。
 
-## 配置重点
+## 上游、参考与许可证
 
-- max_input_size_mb：下载、本地文件和 Base64 的单文件最大体积。
-- max_output_size_mb：输出过大时会自动依次缩放图片、减少 GIF 调色板颜色。
-- max_image_side 与 max_frames：防止高分辨率或超长动图耗尽内存。
-- single_image_gif_duration_ms 与 single_image_gif_frame_count：控制单图转 GIF 的默认节奏。
-- output_format：精灵图合成和视频转动画可选 GIF、APNG、WEBP；其他兼容性优先的命令固定输出 GIF。
-- enable_at_avatar：没有直接图片或回复图片时，变换类命令能否下载被 @ 的 QQ 用户头像；非 QQ 平台可关闭。
-- gif_speed_allow_frame_drop：默认关闭。开启后，调速在无法把每帧压到 20ms 以下时均匀丢帧，以接近目标倍速；会牺牲中间画面流畅度。
+- 主要上游：[shskjw/astrbot_plugin_gifcaijian](https://github.com/shskjw/astrbot_plugin_gifcaijian)
+- 上游提交基线：`beffa3ebc4c6d2c36b8c5825643dc3d0d1057ced`（2026-01-26）
+- 图片变换与 GIF 调速参考：[lirundong093-glitch/astrbot_plugin_pic_toolbox](https://github.com/lirundong093-glitch/astrbot_plugin_pic_toolbox)
+- 本 Fork 仓库：[Whereis-Alice/astrbot_plugin_gif_toolbox](https://github.com/Whereis-Alice/astrbot_plugin_gif_toolbox)
 
-## Fork、标识与许可证
+本插件只参考了图片工具箱中的通用图片处理思路。其表情包、特效类功能、素材以及 OpenCV/numpy 依赖均未引入。
 
-- 上游项目：[shskjw/astrbot_plugin_gifcaijian](https://github.com/shskjw/astrbot_plugin_gifcaijian)
-- 上游提交基线：beffa3ebc4c6d2c36b8c5825643dc3d0d1057ced（2026-01-26）
-- 图片变换参考：[lirundong093-glitch/astrbot_plugin_pic_toolbox](https://github.com/lirundong093-glitch/astrbot_plugin_pic_toolbox)（仅反色、旋转、翻转、对称和 GIF 调速思路）
-- 本插件标识：astrbot_plugin_gif_toolbox
-- Fork 仓库：[Whereis-Alice/astrbot_plugin_gif_toolbox](https://github.com/Whereis-Alice/astrbot_plugin_gif_toolbox)
-
-上游使用 GNU Affero General Public License v3.0。这个修改版同样以
-AGPL-3.0-or-later 发布，并在 LICENSE 中附带完整许可证。若将本插件提供给其他用户或公开部署，
-请依照 AGPL 要求提供对应修改版源码，并保留上游归属说明。
-
-上述图片工具箱的表情包/特效类功能和资源不在本插件范围内，未被合入。
+上游使用 GNU Affero General Public License v3.0。本修改版同样以 AGPL-3.0-or-later 发布；公开部署或向其他用户提供时，请按 AGPL 要求提供对应源码，并保留上游归属说明。
