@@ -26,6 +26,7 @@ from astrbot_plugin_gif_toolbox.media_ops import (
     inspect_animation,
     make_single_image_gif,
     multi_image_to_gif,
+    reverse_animation,
     trim_animation,
     transform_image,
 )
@@ -70,6 +71,63 @@ class MediaOperationTests(unittest.TestCase):
             self.assertEqual(image.info["duration"], 50)
             image.seek(1)
             self.assertEqual(image.info["duration"], 100)
+
+    def test_reverse_animation_reverses_frames_and_frame_durations(self) -> None:
+        frames = [
+            Image.new("RGBA", (16, 16), (255, 0, 0, 255)),
+            Image.new("RGBA", (16, 16), (0, 255, 0, 255)),
+            Image.new("RGBA", (16, 16), (0, 0, 255, 255)),
+        ]
+        source = io.BytesIO()
+        frames[0].save(
+            source,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=[80, 120, 160],
+            loop=0,
+            disposal=2,
+        )
+
+        output, message = reverse_animation(source.getvalue(), self.options)
+        self.assertIn("倒放", message)
+        with Image.open(io.BytesIO(output)) as image:
+            self.assertEqual(image.n_frames, 3)
+            observed: list[tuple[int, int, int]] = []
+            durations: list[int] = []
+            for index in range(image.n_frames):
+                image.seek(index)
+                red, green, blue, _ = image.convert("RGBA").getpixel((0, 0))
+                observed.append((red, green, blue))
+                durations.append(image.info["duration"])
+        self.assertEqual(observed, [(0, 0, 255), (0, 255, 0), (255, 0, 0)])
+        self.assertEqual(durations, [160, 120, 80])
+        with self.assertRaisesRegex(MediaOperationError, "这不是"):
+            reverse_animation(image_bytes((255, 0, 0, 255)), self.options)
+
+    def test_reverse_animation_preserves_transparent_pixels(self) -> None:
+        frames = [Image.new("RGBA", (8, 8), (0, 0, 0, 0)) for _ in range(2)]
+        frames[0].putpixel((2, 2), (255, 0, 0, 255))
+        frames[1].putpixel((5, 2), (0, 0, 255, 255))
+        source = io.BytesIO()
+        frames[0].save(
+            source,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=[100, 120],
+            loop=0,
+            disposal=2,
+            transparency=0,
+        )
+
+        output, _ = reverse_animation(source.getvalue(), self.options)
+        with Image.open(io.BytesIO(output)) as image:
+            self.assertIsNotNone(image.info.get("transparency"))
+            image.seek(0)
+            first_frame = image.convert("RGBA")
+            self.assertEqual(first_frame.getpixel((0, 0))[3], 0)
+            self.assertEqual(first_frame.getpixel((5, 2)), (0, 0, 255, 255))
 
     def test_duplicate_inputs_keep_multi_image_gif_animated(self) -> None:
         source = image_bytes((0, 255, 0, 255))
@@ -423,7 +481,9 @@ class SourceResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(card.startswith(b"\x89PNG\r\n\x1a\n"))
         with Image.open(io.BytesIO(card)) as image:
             self.assertEqual(image.format, "PNG")
-            self.assertEqual(image.size, (1440, 1756))
+            self.assertEqual(image.width, 2048)
+            self.assertGreater(image.height, 2_000)
+            self.assertLess(image.height, 4_000)
 
         plugin = GifToolboxPlugin(None, {})
         event = Event([])
@@ -518,6 +578,17 @@ class SourceResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(event.stopped)
         self.assertTrue((await anext(handler)).startswith("❌ 未检测到图片"))
         self.assertFalse(event.stopped)
+        with self.assertRaises(StopAsyncIteration):
+            await anext(handler)
+        self.assertTrue(event.stopped)
+
+    async def test_animation_reverse_handler_stops_later_matching_handlers(self) -> None:
+        plugin = GifToolboxPlugin(None, {})
+        event = Event([], message_str="倒放")
+        handler = plugin.reverse_gif(event)
+
+        self.assertEqual(await anext(handler), "⏳ 正在倒放动图...")
+        self.assertTrue((await anext(handler)).startswith("❌ 未检测到图片"))
         with self.assertRaises(StopAsyncIteration):
             await anext(handler)
         self.assertTrue(event.stopped)

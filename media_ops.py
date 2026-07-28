@@ -131,6 +131,45 @@ def _animation_info(data: bytes) -> tuple[int, bool]:
         image.close()
 
 
+def _gif_palette_frames(
+    frames: list[Image.Image],
+    colors: int,
+) -> tuple[list[Image.Image], int | None]:
+    """Quantize RGBA frames while reserving one GIF palette index for alpha."""
+
+    rgba_frames = [frame.convert("RGBA") for frame in frames]
+    has_transparency = any(frame.getchannel("A").getextrema()[0] < 255 for frame in rgba_frames)
+    if not has_transparency:
+        return (
+            [
+                frame.convert(
+                    "P",
+                    palette=Image.Palette.ADAPTIVE,
+                    colors=max(2, min(256, colors)),
+                )
+                for frame in rgba_frames
+            ],
+            None,
+        )
+
+    # GIF has only one binary transparency index. Reserve 255 so visible
+    # colors cannot be mistaken for transparent pixels after quantization.
+    palette_frames: list[Image.Image] = []
+    for frame in rgba_frames:
+        alpha = frame.getchannel("A")
+        rgb = Image.new("RGB", frame.size, (0, 0, 0))
+        rgb.paste(frame, mask=alpha)
+        palette_frame = rgb.convert(
+            "P",
+            palette=Image.Palette.ADAPTIVE,
+            colors=max(1, min(255, colors - 1)),
+        )
+        transparency_mask = alpha.point(lambda value: 255 if value < 128 else 0)
+        palette_frame.paste(255, mask=transparency_mask)
+        palette_frames.append(palette_frame)
+    return palette_frames, 255
+
+
 def _encode_animation_once(
     frames: list[Image.Image],
     durations: list[int],
@@ -149,24 +188,18 @@ def _encode_animation_once(
 
     try:
         if format_name == "GIF":
-            palette_frames = [
-                frame.convert("RGBA").convert(
-                    "P",
-                    palette=Image.Palette.ADAPTIVE,
-                    colors=max(2, min(256, colors)),
-                )
-                for frame in frames
-            ]
-            palette_frames[0].save(
-                output,
-                format="GIF",
-                save_all=True,
-                append_images=palette_frames[1:],
-                duration=duration_arg,
-                loop=0,
-                disposal=2,
-                optimize=False,
-            )
+            palette_frames, transparency = _gif_palette_frames(frames, colors)
+            save_kwargs: dict[str, int | bool | list[Image.Image] | list[int]] = {
+                "save_all": True,
+                "append_images": palette_frames[1:],
+                "duration": duration_arg,
+                "loop": 0,
+                "disposal": 2,
+                "optimize": False,
+            }
+            if transparency is not None:
+                save_kwargs["transparency"] = transparency
+            palette_frames[0].save(output, format="GIF", **save_kwargs)
         elif format_name == "APNG":
             rgba_frames = [frame.convert("RGBA") for frame in frames]
             rgba_frames[0].save(
@@ -324,6 +357,20 @@ def change_gif_speed(
             f"✅ GIF 已调速至约 {actual_factor:g} 倍（受 20ms 最小帧间隔限制）{suffix}",
         )
     return result, f"✅ GIF 已调整为 {factor:g} 倍速度{suffix}"
+
+
+def reverse_animation(data: bytes, options: MediaOptions) -> tuple[bytes, str]:
+    """Reverse an animation while keeping every frame paired with its duration."""
+
+    total, animated = _animation_info(data)
+    frames, durations, _ = _animation_frames(data, options)
+    if not animated:
+        raise MediaOperationError("这不是 GIF/APNG/WebP 动图")
+
+    result, reduced = encode_animation(frames[::-1], durations[::-1], options, "GIF")
+    sampling = f"（原始 {total} 帧，均匀采样为 {len(frames)} 帧）" if len(frames) < total else f"（{len(frames)} 帧）"
+    suffix = "，已为控制体积自动压缩" if reduced else ""
+    return result, f"✅ 动图已倒放{sampling}{suffix}"
 
 
 _CROP_ANCHORS: dict[str, tuple[str, str]] = {

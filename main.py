@@ -41,6 +41,7 @@ from .media_ops import (
     inspect_animation,
     make_single_image_gif,
     multi_image_to_gif,
+    reverse_animation,
     sprite_sheet_to_animation,
     trim_animation,
     transform_image,
@@ -49,8 +50,8 @@ from .media_ops import (
 
 
 PLUGIN_ID = "astrbot_plugin_gif_toolbox"
-PLUGIN_VERSION = "v2.4.0"
-PLUGIN_DESC = "独立 Fork 的 GIF/APNG/WebP 图片工具箱：可靠下载、变速、裁剪、信息查看、图片速查、合成与图像变换"
+PLUGIN_VERSION = "v2.5.0"
+PLUGIN_DESC = "独立 Fork 的 GIF/APNG/WebP 图片工具箱：可靠下载、变速、倒放、裁剪、信息查看、图片速查、合成与图像变换"
 FORK_REPO = "https://github.com/Whereis-Alice/astrbot_plugin_gif_toolbox"
 UPSTREAM_REPO = "https://github.com/shskjw/astrbot_plugin_gifcaijian"
 PIC_TOOLBOX_REPO = "https://github.com/lirundong093-glitch/astrbot_plugin_pic_toolbox"
@@ -787,6 +788,27 @@ class GifToolboxPlugin(Star):
         factor = self._parse_factor(event.message_str)
         async for result in self._change_speed(event, factor, factor, "调速"):
             yield result
+
+    @filter.command("倒放", alias={"gif倒放", "动图倒放"}, priority=10)
+    async def reverse_gif(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """倒序播放 GIF/APNG/WebP 动图，保留每一帧原有时长。"""
+
+        settings = self._settings()
+        yield event.plain_result("⏳ 正在倒放动图...")
+        try:
+            result, message = await asyncio.to_thread(
+                reverse_animation,
+                await self._load_image(event, settings),
+                settings.media_options(),
+            )
+            yield self._image_result(event, message, result)
+        except MediaOperationError as exc:
+            yield event.plain_result(f"❌ {exc}")
+        except Exception:
+            logger.exception("[%s] animation reverse failed", PLUGIN_ID)
+            yield event.plain_result("❌ 动图倒放失败，请稍后重试")
+        finally:
+            event.stop_event()
 
     async def _apply_image_transform(
         self,

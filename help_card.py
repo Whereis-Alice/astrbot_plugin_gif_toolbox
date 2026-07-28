@@ -39,6 +39,11 @@ HELP_CARD_SECTIONS: Final = (
                 "/调速 0.5 表示半速。兼容写法：变快、变慢。",
             ),
             HelpCardEntry(
+                "/倒放",
+                "别名：/gif倒放、/动图倒放。回复 GIF/APNG/WebP 动图，"
+                "按原帧时长倒序播放。",
+            ),
+            HelpCardEntry(
                 "/gif裁剪",
                 "别名：/动图裁剪。比例 宽:高 [位置]、尺寸 宽×高 [位置]、"
                 "边距 N [单边边距]；比例和尺寸默认居中。",
@@ -144,6 +149,7 @@ HELP_CARD_COMMANDS: Final = frozenset(
         "加速",
         "减速",
         "调速",
+        "倒放",
         "反色",
         "顺时针",
         "逆时针",
@@ -175,7 +181,7 @@ class HelpCardAssetError(RuntimeError):
 
 
 def load_help_card() -> bytes:
-    """Return the packaged PNG help card without requiring host CJK fonts."""
+    """Return the packaged high-resolution PNG help card without host CJK fonts."""
 
     try:
         data = HELP_CARD_PATH.read_bytes()
