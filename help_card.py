@@ -132,7 +132,7 @@ HELP_CARD_SECTIONS: Final = (
     ),
 )
 
-HELP_CARD_COLUMNS: Final = ((0, 1, 4), (2, 3))
+HELP_CARD_COLUMNS: Final = ((0, 1), (2, 3, 4))
 HELP_CARD_FOOTER: Final = (
     "使用方式：回复目标素材消息，或与命令同一条附带图片、动图或视频。",
     (
