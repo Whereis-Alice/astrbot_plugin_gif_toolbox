@@ -16,8 +16,10 @@ import astrbot.api.message_components as Comp
 
 from astrbot_plugin_gif_toolbox.main import GifToolboxPlugin
 from astrbot_plugin_gif_toolbox.media_ops import (
+    MediaOperationError,
     MediaOptions,
     change_gif_speed,
+    crop_animation,
     decompose_animation,
     make_single_image_gif,
     multi_image_to_gif,
@@ -87,6 +89,82 @@ class MediaOperationTests(unittest.TestCase):
             disposal=2,
         )
         self.assertEqual(len(decompose_animation(source.getvalue(), self.options)), 2)
+
+    def test_animation_crop_uses_one_anchor_box_and_preserves_timing(self) -> None:
+        frames: list[Image.Image] = []
+        for blue in (40, 180):
+            frame = Image.new("RGBA", (6, 4))
+            for y in range(frame.height):
+                for x in range(frame.width):
+                    frame.putpixel((x, y), (x * 30, y * 40, blue, 255))
+            frames.append(frame)
+        source = io.BytesIO()
+        frames[0].save(
+            source,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=[80, 120],
+            loop=0,
+            disposal=2,
+        )
+
+        output, message = crop_animation(
+            source.getvalue(),
+            self.options,
+            aspect_ratio=(1, 1),
+            anchor="top_right",
+        )
+        self.assertIn("整体裁剪为 4×4", message)
+        self.assertIn("比例 1:1，右上", message)
+        with Image.open(io.BytesIO(output)) as image:
+            self.assertEqual(image.size, (4, 4))
+            self.assertEqual(image.n_frames, 2)
+            image.seek(0)
+            self.assertEqual(image.info["duration"], 80)
+            self.assertEqual(image.convert("RGBA").getpixel((0, 0)), (60, 0, 40, 255))
+            image.seek(1)
+            self.assertEqual(image.info["duration"], 120)
+            self.assertEqual(image.convert("RGBA").getpixel((0, 0)), (60, 0, 180, 255))
+
+    def test_animation_crop_supports_size_and_margins_and_rejects_static_images(self) -> None:
+        frames = [
+            Image.new("RGBA", (6, 4), (255, 0, 0, 255)),
+            Image.new("RGBA", (6, 4), (0, 0, 255, 255)),
+        ]
+        source = io.BytesIO()
+        frames[0].save(
+            source,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=[100, 100],
+            loop=0,
+            disposal=2,
+        )
+
+        sized, _ = crop_animation(
+            source.getvalue(),
+            self.options,
+            target_size=(3, 2),
+            anchor="bottom_left",
+        )
+        margined, _ = crop_animation(
+            source.getvalue(),
+            self.options,
+            margins=(1, 1, 2, 1),
+        )
+        with Image.open(io.BytesIO(sized)) as image:
+            self.assertEqual(image.size, (3, 2))
+        with Image.open(io.BytesIO(margined)) as image:
+            self.assertEqual(image.size, (3, 2))
+
+        with self.assertRaisesRegex(MediaOperationError, "动图"):
+            crop_animation(image_bytes((255, 0, 0, 255)), self.options, aspect_ratio=(1, 1))
+        with self.assertRaisesRegex(MediaOperationError, "超出"):
+            crop_animation(source.getvalue(), self.options, target_size=(7, 2))
+        with self.assertRaisesRegex(MediaOperationError, "位置"):
+            crop_animation(source.getvalue(), self.options, aspect_ratio=(1, 1), anchor="unknown")
 
     def test_static_transforms_preserve_alpha_and_odd_sized_symmetry(self) -> None:
         source_image = Image.new("RGBA", (5, 1))
@@ -197,9 +275,15 @@ class Message:
 
 
 class Event:
-    def __init__(self, message: list[object], bot: object | None = None) -> None:
+    def __init__(
+        self,
+        message: list[object],
+        bot: object | None = None,
+        message_str: str = "",
+    ) -> None:
         self.message_obj = Message(message)
         self.bot = bot
+        self.message_str = message_str
         self.stopped = False
 
     def get_messages(self) -> list[object]:
@@ -214,6 +298,39 @@ class Event:
 
 
 class SourceResolutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_animation_crop_parser_supports_ratio_size_margins_and_anchor(self) -> None:
+        plugin = GifToolboxPlugin(None, {})
+
+        ratio = plugin._parse_animation_crop("gif裁剪 16:9 右上")
+        self.assertEqual(ratio.aspect_ratio, (16, 9))
+        self.assertEqual(ratio.anchor, "top_right")
+
+        size = plugin._parse_animation_crop("gif裁剪 尺寸 512x288 左下")
+        self.assertEqual(size.target_size, (512, 288))
+        self.assertEqual(size.anchor, "bottom_left")
+
+        margins = plugin._parse_animation_crop("gif裁剪 边距 8 上边距 4")
+        self.assertEqual(margins.margins, (8, 4, 8, 8))
+        self.assertEqual(margins.anchor, "center")
+
+        with self.assertRaisesRegex(MediaOperationError, "指定一种"):
+            plugin._parse_animation_crop("gif裁剪")
+        with self.assertRaisesRegex(MediaOperationError, "边距裁剪不支持"):
+            plugin._parse_animation_crop("gif裁剪 边距 8 右上")
+
+    async def test_animation_crop_handler_stops_later_matching_handlers(self) -> None:
+        plugin = GifToolboxPlugin(None, {})
+        event = Event([], message_str="gif裁剪 1:1")
+        handler = plugin.crop_animation_gif(event)
+
+        self.assertEqual(await anext(handler), "⏳ 正在整体裁剪动图...")
+        self.assertFalse(event.stopped)
+        self.assertTrue((await anext(handler)).startswith("❌ 未检测到图片"))
+        self.assertFalse(event.stopped)
+        with self.assertRaises(StopAsyncIteration):
+            await anext(handler)
+        self.assertTrue(event.stopped)
+
     async def test_transform_handler_stops_later_matching_handlers(self) -> None:
         plugin = GifToolboxPlugin(None, {})
         event = Event([])

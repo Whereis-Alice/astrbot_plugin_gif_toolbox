@@ -33,6 +33,7 @@ from .media_ops import (
     MediaOptions,
     age_image,
     change_gif_speed,
+    crop_animation,
     crop_grid,
     decompose_animation,
     image_to_line_art,
@@ -45,8 +46,8 @@ from .media_ops import (
 
 
 PLUGIN_ID = "astrbot_plugin_gif_toolbox"
-PLUGIN_VERSION = "v2.1.1"
-PLUGIN_DESC = "独立 Fork 的 GIF/APNG/WebP 图片工具箱：可靠下载、变速、裁剪、合成、图像变换与单图转 GIF"
+PLUGIN_VERSION = "v2.2.0"
+PLUGIN_DESC = "独立 Fork 的 GIF/APNG/WebP 图片工具箱：可靠下载、变速、整体裁剪、合成、图像变换与单图转 GIF"
 FORK_REPO = "https://github.com/Whereis-Alice/astrbot_plugin_gif_toolbox"
 UPSTREAM_REPO = "https://github.com/shskjw/astrbot_plugin_gifcaijian"
 PIC_TOOLBOX_REPO = "https://github.com/lirundong093-glitch/astrbot_plugin_pic_toolbox"
@@ -65,6 +66,16 @@ class SourceCandidate:
     reference: str
     component: Any | None
     origin: str
+
+
+@dataclass(frozen=True)
+class AnimationCropRequest:
+    """Validated whole-animation crop settings parsed from a command."""
+
+    aspect_ratio: tuple[int, int] | None = None
+    target_size: tuple[int, int] | None = None
+    margins: tuple[int, int, int, int] | None = None
+    anchor: str = "center"
 
 
 @dataclass(frozen=True)
@@ -601,6 +612,53 @@ class GifToolboxPlugin(Star):
         return values["left"], values["top"], values["right"], values["bottom"]
 
     @staticmethod
+    def _parse_crop_anchor(text: str) -> str:
+        normalized = text.replace("中央", "居中").replace("中心", "居中").replace("中间", "居中")
+        for label, anchor in (
+            ("左上", "top_left"),
+            ("右上", "top_right"),
+            ("左下", "bottom_left"),
+            ("右下", "bottom_right"),
+        ):
+            if label in normalized:
+                return anchor
+        if "居中" in normalized:
+            return "center"
+        for label, anchor in (("左", "left"), ("右", "right"), ("上", "top"), ("下", "bottom")):
+            if re.search(rf"(?<![上下左右]){label}(?![上下左右边])", normalized):
+                return anchor
+        return "center"
+
+    @classmethod
+    def _parse_animation_crop(cls, text: str) -> AnimationCropRequest:
+        """Parse mutually exclusive ratio, size, or margin crop syntax."""
+
+        ratio_match = re.search(r"(?:比例\s*)?(\d+)\s*[:：]\s*(\d+)", text)
+        if ratio_match is None:
+            ratio_match = re.search(r"比例\s*(\d+)\s*[*x×]\s*(\d+)", text, re.IGNORECASE)
+        size_match = re.search(r"(?:尺寸|大小)\s*(\d+)\s*[*x×]\s*(\d+)", text, re.IGNORECASE)
+        margins_requested = bool(re.search(r"([上下左右])?\s*边距\s*\d+", text))
+
+        if sum((ratio_match is not None, size_match is not None, margins_requested)) != 1:
+            raise MediaOperationError("请指定一种裁剪方式：比例 1:1、尺寸 512x512 或边距 20")
+
+        anchor = cls._parse_crop_anchor(text)
+        if ratio_match is not None:
+            width, height = (int(value) for value in ratio_match.groups())
+            if not 1 <= width <= 10_000 or not 1 <= height <= 10_000:
+                raise MediaOperationError("裁剪比例的两个数必须在 1 到 10000 之间")
+            return AnimationCropRequest(aspect_ratio=(width, height), anchor=anchor)
+        if size_match is not None:
+            width, height = (int(value) for value in size_match.groups())
+            if not 1 <= width <= 4096 or not 1 <= height <= 4096:
+                raise MediaOperationError("裁剪尺寸的宽高必须在 1 到 4096 像素之间")
+            return AnimationCropRequest(target_size=(width, height), anchor=anchor)
+
+        if anchor != "center":
+            raise MediaOperationError("边距裁剪不支持位置参数")
+        return AnimationCropRequest(margins=cls._parse_margins(text))
+
+    @staticmethod
     def _parse_duration_ms(text: str, default_ms: int) -> int:
         fps_match = re.search(r"(\d+(?:\.\d+)?)\s*fps\b", text, re.IGNORECASE)
         if fps_match:
@@ -888,6 +946,34 @@ class GifToolboxPlugin(Star):
             logger.exception("[%s] multi-image GIF processing failed", PLUGIN_ID)
             yield event.plain_result("❌ 多图合成失败，请稍后重试")
 
+    @filter.command("gif裁剪", alias={"动图裁剪"}, priority=10)
+    async def crop_animation_gif(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """整体裁剪 GIF/APNG/WebP：gif裁剪 1:1 或 gif裁剪 尺寸 512x512。"""
+
+        settings = self._settings()
+        try:
+            request = self._parse_animation_crop(event.message_str)
+            yield event.plain_result("⏳ 正在整体裁剪动图...")
+            result, message = await asyncio.to_thread(
+                crop_animation,
+                await self._load_image(event, settings),
+                settings.media_options(),
+                aspect_ratio=request.aspect_ratio,
+                target_size=request.target_size,
+                margins=request.margins,
+                anchor=request.anchor,
+            )
+            yield self._image_result(event, message, result)
+        except MediaOperationError as exc:
+            yield event.plain_result(f"❌ {exc}")
+        except Exception:
+            logger.exception("[%s] animation crop processing failed", PLUGIN_ID)
+            yield event.plain_result("❌ 动图裁剪失败，请稍后重试")
+        finally:
+            # Keep this distinct from the grid-crop command if another plugin
+            # also has a broad image-cropping handler.
+            event.stop_event()
+
     @filter.command("裁剪")
     async def crop_and_forward(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         """按网格裁剪图片：裁剪 2x3 边距 8。"""
@@ -1017,7 +1103,8 @@ class GifToolboxPlugin(Star):
             "• 反色、顺时针、逆时针、左右翻转、上下翻转\n"
             "• 左对称、右对称、上对称、下对称（均支持静态图和动图）\n"
             "• 合成1gif / 合成2gif [6x6] [0.1s] [边距 8]\n"
-            "• 多图合成gif [0.5s]、裁剪 [2x3]、gif分解\n"
+            "• gif裁剪 [比例 1:1 / 尺寸 512x512 / 边距 20]、裁剪 [2x3]\n"
+            "• 多图合成gif [0.5s]、gif分解\n"
             "• 图片转线稿、表情包做旧 [次数]、视频转gif [1s-4s fps 10 0.5]\n\n"
             f"这是 {UPSTREAM_REPO} 的独立 AGPL-3.0-or-later Fork；"
             f"图片变换功能参考了 {PIC_TOOLBOX_REPO}。"

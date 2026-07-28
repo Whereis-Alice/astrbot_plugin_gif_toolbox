@@ -307,6 +307,124 @@ def change_gif_speed(
     return result, f"✅ GIF 已调整为 {factor:g} 倍速度{suffix}"
 
 
+_CROP_ANCHORS: dict[str, tuple[str, str]] = {
+    "top_left": ("left", "top"),
+    "top": ("center", "top"),
+    "top_right": ("right", "top"),
+    "left": ("left", "center"),
+    "center": ("center", "center"),
+    "right": ("right", "center"),
+    "bottom_left": ("left", "bottom"),
+    "bottom": ("center", "bottom"),
+    "bottom_right": ("right", "bottom"),
+}
+
+_CROP_ANCHOR_LABELS = {
+    "top_left": "左上",
+    "top": "上方",
+    "top_right": "右上",
+    "left": "左侧",
+    "center": "居中",
+    "right": "右侧",
+    "bottom_left": "左下",
+    "bottom": "下方",
+    "bottom_right": "右下",
+}
+
+
+def _crop_offset(available: int, alignment: str) -> int:
+    if alignment == "left" or alignment == "top":
+        return 0
+    if alignment == "right" or alignment == "bottom":
+        return available
+    return available // 2
+
+
+def _anchored_crop_box(
+    width: int,
+    height: int,
+    crop_width: int,
+    crop_height: int,
+    anchor: str,
+) -> tuple[int, int, int, int]:
+    try:
+        horizontal, vertical = _CROP_ANCHORS[anchor]
+    except KeyError as exc:
+        raise MediaOperationError("不支持的裁剪位置") from exc
+    if not 1 <= crop_width <= width or not 1 <= crop_height <= height:
+        raise MediaOperationError("裁剪尺寸超出动图画布")
+    x0 = _crop_offset(width - crop_width, horizontal)
+    y0 = _crop_offset(height - crop_height, vertical)
+    return x0, y0, x0 + crop_width, y0 + crop_height
+
+
+def crop_animation(
+    data: bytes,
+    options: MediaOptions,
+    *,
+    aspect_ratio: tuple[int, int] | None = None,
+    target_size: tuple[int, int] | None = None,
+    margins: tuple[int, int, int, int] | None = None,
+    anchor: str = "center",
+) -> tuple[bytes, str]:
+    """Crop every frame of an animation with one shared crop box.
+
+    Exactly one of ``aspect_ratio``, ``target_size`` or ``margins`` must be
+    supplied. The input is composited before cropping, so GIF disposal and
+    transparency are preserved consistently across frames.
+    """
+
+    modes = sum(value is not None for value in (aspect_ratio, target_size, margins))
+    if modes != 1:
+        raise MediaOperationError("请指定一种动图裁剪方式")
+    if anchor not in _CROP_ANCHORS:
+        raise MediaOperationError("不支持的裁剪位置")
+    frames, durations, animated = _animation_frames(data, options)
+    if not animated:
+        raise MediaOperationError("这不是 GIF/APNG/WebP 动图")
+
+    width, height = frames[0].size
+    if aspect_ratio is not None:
+        ratio_width, ratio_height = aspect_ratio
+        if ratio_width < 1 or ratio_height < 1:
+            raise MediaOperationError("裁剪比例必须为正数")
+        if width * ratio_height >= height * ratio_width:
+            crop_width = max(1, min(width, height * ratio_width // ratio_height))
+            crop_height = height
+        else:
+            crop_width = width
+            crop_height = max(1, min(height, width * ratio_height // ratio_width))
+        crop_box = _anchored_crop_box(width, height, crop_width, crop_height, anchor)
+        detail = f"比例 {ratio_width}:{ratio_height}，{_CROP_ANCHOR_LABELS[anchor]}"
+    elif target_size is not None:
+        crop_width, crop_height = target_size
+        if crop_width < 1 or crop_height < 1:
+            raise MediaOperationError("裁剪尺寸必须为正数")
+        crop_box = _anchored_crop_box(width, height, crop_width, crop_height, anchor)
+        detail = f"尺寸 {crop_width}×{crop_height}，{_CROP_ANCHOR_LABELS[anchor]}"
+    else:
+        assert margins is not None
+        left, top, right, bottom = margins
+        if min(margins) < 0:
+            raise MediaOperationError("边距不能为负数")
+        crop_width = width - left - right
+        crop_height = height - top - bottom
+        if crop_width < 1 or crop_height < 1:
+            raise MediaOperationError("边距超过动图画布")
+        crop_box = (left, top, left + crop_width, top + crop_height)
+        detail = f"边距 左{left} 上{top} 右{right} 下{bottom}"
+
+    cropped = [frame.crop(crop_box) for frame in frames]
+    output, reduced = encode_animation(cropped, durations, options, "GIF")
+    suffix = "，已为控制体积自动压缩" if reduced else ""
+    crop_width = crop_box[2] - crop_box[0]
+    crop_height = crop_box[3] - crop_box[1]
+    return (
+        output,
+        f"✅ 动图已整体裁剪为 {crop_width}×{crop_height}（{detail}，{len(cropped)} 帧）{suffix}",
+    )
+
+
 def _invert_rgba(image: Image.Image) -> Image.Image:
     red, green, blue, alpha = image.convert("RGBA").split()
     inverted = ImageOps.invert(Image.merge("RGB", (red, green, blue)))
