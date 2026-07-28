@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import astrbot.api.message_components as Comp
 
 from astrbot_plugin_gif_toolbox.main import GifToolboxPlugin
+from astrbot_plugin_gif_toolbox.help_card import HELP_CARD_COMMANDS, HELP_CARD_SECTIONS, load_help_card
 from astrbot_plugin_gif_toolbox.media_ops import (
     MediaOperationError,
     MediaOptions,
@@ -399,8 +401,40 @@ class Event:
     def plain_result(text: str) -> str:
         return text
 
+    @staticmethod
+    def chain_result(chain: list[object]) -> list[object]:
+        return chain
+
 
 class SourceResolutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_help_card_covers_registered_commands_and_handler_returns_png(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
+        registered_commands = set(re.findall(r'@filter\.command\("([^"]+)"', source))
+        self.assertEqual(registered_commands, HELP_CARD_COMMANDS)
+        card_source = "\n".join(
+            f"{entry.command}\n{entry.detail}"
+            for section in HELP_CARD_SECTIONS
+            for entry in section.entries
+        )
+        for command in registered_commands:
+            self.assertIn(f"/{command}", card_source)
+
+        card = load_help_card()
+        self.assertTrue(card.startswith(b"\x89PNG\r\n\x1a\n"))
+        with Image.open(io.BytesIO(card)) as image:
+            self.assertEqual(image.format, "PNG")
+            self.assertEqual(image.size, (1440, 1756))
+
+        plugin = GifToolboxPlugin(None, {})
+        event = Event([])
+        handler = plugin.gif_toolbox_help(event)
+        result = await anext(handler)
+        self.assertEqual(result[0].text, "GIF 工具箱命令速查")
+        self.assertTrue(result[1].file.startswith("base64://"))
+        with self.assertRaises(StopAsyncIteration):
+            await anext(handler)
+        self.assertTrue(event.stopped)
+
     async def test_animation_trim_parser_supports_front_back_and_ranges(self) -> None:
         plugin = GifToolboxPlugin(None, {})
 

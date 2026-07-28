@@ -28,6 +28,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 import astrbot.api.message_components as Comp
 from astrbot.api.star import Context, Star, register
 
+from .help_card import HelpCardAssetError, load_help_card
 from .media_ops import (
     MediaOperationError,
     MediaOptions,
@@ -48,8 +49,8 @@ from .media_ops import (
 
 
 PLUGIN_ID = "astrbot_plugin_gif_toolbox"
-PLUGIN_VERSION = "v2.3.0"
-PLUGIN_DESC = "独立 Fork 的 GIF/APNG/WebP 图片工具箱：可靠下载、变速、整体裁剪、帧截取、信息查看、合成与图像变换"
+PLUGIN_VERSION = "v2.4.0"
+PLUGIN_DESC = "独立 Fork 的 GIF/APNG/WebP 图片工具箱：可靠下载、变速、裁剪、信息查看、图片速查、合成与图像变换"
 FORK_REPO = "https://github.com/Whereis-Alice/astrbot_plugin_gif_toolbox"
 UPSTREAM_REPO = "https://github.com/shskjw/astrbot_plugin_gifcaijian"
 PIC_TOOLBOX_REPO = "https://github.com/lirundong093-glitch/astrbot_plugin_pic_toolbox"
@@ -1175,22 +1176,15 @@ class GifToolboxPlugin(Star):
                 except OSError:
                     logger.warning("[%s] could not remove temporary video %s", PLUGIN_ID, path)
 
-    @filter.command("gif工具箱帮助")
+    @filter.command("gif工具箱帮助", alias={"gif速查", "动图速查"}, priority=10)
     async def gif_toolbox_help(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
-        """显示 GIF 工具箱的主要命令和 AGPL 源码提示。"""
+        """发送包含全部命令、别名与关键参数的 PNG 速查图。"""
 
-        yield event.plain_result(
-            "GIF 工具箱命令：\n"
-            "• 图片转gif [0.5s]（别名：单图转gif）\n"
-            "• 加速 [倍数] / 减速 [倍数] / 调速 [倍率]（回复动图）\n"
-            "• 反色、顺时针、逆时针、左右翻转、上下翻转\n"
-            "• 左对称、右对称、上对称、下对称（均支持静态图和动图）\n"
-            "• 合成1gif / 合成2gif [6x6] [0.1s] [边距 8]\n"
-            "• gif裁剪 [比例 1:1 / 尺寸 512x512 / 边距 20]、裁剪 [2x3]\n"
-            "• gif截取 [前10帧 / 后10帧 / 10-60帧]、gif信息\n"
-            "• 多图合成gif [0.5s]、gif分解\n"
-            "• 图片转线稿、表情包做旧 [次数]、视频转gif [1s-4s fps 10 0.5]\n\n"
-            f"这是 {UPSTREAM_REPO} 的独立 AGPL-3.0-or-later Fork；"
-            f"图片变换功能参考了 {PIC_TOOLBOX_REPO}。"
-            "当前版本源码请向机器人管理员索取，管理员发布时应提供其 Fork 仓库。"
-        )
+        try:
+            card = await asyncio.to_thread(load_help_card)
+            yield self._image_result(event, "GIF 工具箱命令速查", card)
+        except HelpCardAssetError:
+            logger.exception("[%s] packaged help card is unavailable", PLUGIN_ID)
+            yield event.plain_result("❌ 命令速查图片不可用，请查看插件 README")
+        finally:
+            event.stop_event()
