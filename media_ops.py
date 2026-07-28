@@ -311,8 +311,10 @@ def change_gif_speed(
 ) -> tuple[bytes, str]:
     """Change GIF speed, optionally dropping frames once 20ms frame timing is reached."""
 
-    if not 0.1 <= factor <= 20:
-        raise MediaOperationError("倍速必须在 0.1 到 20 之间")
+    # ``/减速 20`` is represented internally as a 0.05 playback factor.
+    # Keep the public 0.1-20 command multiplier range usable in both directions.
+    if not 0.05 <= factor <= 20:
+        raise MediaOperationError("倍速必须在 0.05 到 20 之间")
     frames, durations, animated = _animation_frames(data, options)
     if not animated:
         raise MediaOperationError("这不是 GIF/APNG/WebP 动图")

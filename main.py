@@ -50,7 +50,7 @@ from .media_ops import (
 
 
 PLUGIN_ID = "astrbot_plugin_gif_toolbox"
-PLUGIN_VERSION = "v2.5.0"
+PLUGIN_VERSION = "v2.5.1"
 PLUGIN_DESC = "独立 Fork 的 GIF/APNG/WebP 图片工具箱：可靠下载、变速、倒放、裁剪、信息查看、图片速查、合成与图像变换"
 FORK_REPO = "https://github.com/Whereis-Alice/astrbot_plugin_gif_toolbox"
 UPSTREAM_REPO = "https://github.com/shskjw/astrbot_plugin_gifcaijian"

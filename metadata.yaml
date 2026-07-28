@@ -1,7 +1,7 @@
 name: astrbot_plugin_gif_toolbox
 display_name: GIF 工具箱（独立 Fork）
 desc: GIF/APNG/WebP 工具箱，支持图片速查、倒放、整体裁剪、按帧截取、动图信息、单图转 GIF、变速、图片变换、合成与分解。
-version: v2.5.0
+version: v2.5.1
 author: Whereis-Alice (fork of shskjw)
 repo: https://github.com/Whereis-Alice/astrbot_plugin_gif_toolbox
 upstream_repo: https://github.com/shskjw/astrbot_plugin_gifcaijian

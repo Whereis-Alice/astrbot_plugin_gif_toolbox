@@ -72,6 +72,29 @@ class MediaOperationTests(unittest.TestCase):
             image.seek(1)
             self.assertEqual(image.info["duration"], 100)
 
+    def test_speed_change_supports_twentyfold_slowdown(self) -> None:
+        frames = [
+            Image.new("RGBA", (32, 24), (255, 0, 0, 255)),
+            Image.new("RGBA", (32, 24), (0, 0, 255, 255)),
+        ]
+        source = io.BytesIO()
+        frames[0].save(
+            source,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=[100, 200],
+            loop=0,
+            disposal=2,
+        )
+
+        output, _ = change_gif_speed(source.getvalue(), 0.05, self.options)
+        with Image.open(io.BytesIO(output)) as image:
+            image.seek(0)
+            self.assertEqual(image.info["duration"], 2000)
+            image.seek(1)
+            self.assertEqual(image.info["duration"], 4000)
+
     def test_reverse_animation_reverses_frames_and_frame_durations(self) -> None:
         frames = [
             Image.new("RGBA", (16, 16), (255, 0, 0, 255)),
@@ -476,6 +499,11 @@ class SourceResolutionTests(unittest.IsolatedAsyncioTestCase):
         )
         for command in registered_commands:
             self.assertIn(f"/{command}", card_source)
+
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+        for command in registered_commands:
+            self.assertIn(f"/{command}", readme)
+        self.assertIn("shskjw/astrbot_plugin_gifcaijian", readme)
 
         card = load_help_card()
         self.assertTrue(card.startswith(b"\x89PNG\r\n\x1a\n"))
