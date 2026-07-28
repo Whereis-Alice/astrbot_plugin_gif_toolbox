@@ -88,17 +88,25 @@ def _sample_indices(total: int, maximum: int) -> list[int]:
     return sorted({round(index * (total - 1) / (maximum - 1)) for index in range(maximum)})
 
 
-def _animation_frames(data: bytes, options: MediaOptions) -> tuple[list[Image.Image], list[int], bool]:
-    """Load sampled composited frames, their durations, and the animation flag."""
+def _animation_frames(
+    data: bytes,
+    options: MediaOptions,
+    indices: Iterable[int] | None = None,
+) -> tuple[list[Image.Image], list[int], bool]:
+    """Load composited frames, sampling all frames unless explicit indices are supplied."""
 
     image = _open_image(data)
     try:
         total = max(1, int(getattr(image, "n_frames", 1)))
         animated = bool(getattr(image, "is_animated", False) and total > 1)
-        indices = _sample_indices(total, options.max_frames)
+        selected_indices = _sample_indices(total, options.max_frames) if indices is None else list(indices)
+        if not selected_indices:
+            raise MediaOperationError("图片中没有可用帧")
+        if any(index < 0 or index >= total for index in selected_indices):
+            raise MediaOperationError("动画帧索引超出范围")
         frames: list[Image.Image] = []
         durations: list[int] = []
-        for index in indices:
+        for index in selected_indices:
             image.seek(index)
             duration = int(image.info.get("duration", 100) or 100)
             frames.append(fit_within(image.copy(), options.max_side))
@@ -108,6 +116,17 @@ def _animation_frames(data: bytes, options: MediaOptions) -> tuple[list[Image.Im
         return frames, durations, animated
     except EOFError as exc:
         raise MediaOperationError("动画帧数据不完整") from exc
+    finally:
+        image.close()
+
+
+def _animation_info(data: bytes) -> tuple[int, bool]:
+    """Read animation metadata without decoding every source frame."""
+
+    image = _open_image(data)
+    try:
+        total = max(1, int(getattr(image, "n_frames", 1)))
+        return total, bool(getattr(image, "is_animated", False) and total > 1)
     finally:
         image.close()
 
@@ -423,6 +442,152 @@ def crop_animation(
         output,
         f"✅ 动图已整体裁剪为 {crop_width}×{crop_height}（{detail}，{len(cropped)} 帧）{suffix}",
     )
+
+
+def trim_animation(
+    data: bytes,
+    options: MediaOptions,
+    *,
+    drop_first: int = 0,
+    drop_last: int = 0,
+    keep_range: tuple[int, int] | None = None,
+) -> tuple[bytes, str]:
+    """Remove leading/trailing frames or keep an inclusive, one-based frame range."""
+
+    if drop_first < 0 or drop_last < 0:
+        raise MediaOperationError("要移除的帧数不能为负数")
+    if keep_range is not None and (drop_first or drop_last):
+        raise MediaOperationError("保留范围不能和前后删帧同时使用")
+
+    total, animated = _animation_info(data)
+    if not animated:
+        raise MediaOperationError("这不是 GIF/APNG/WebP 动图")
+
+    if keep_range is not None:
+        start_frame, end_frame = keep_range
+        if start_frame < 1 or end_frame < 1 or start_frame > end_frame:
+            raise MediaOperationError("保留帧范围无效")
+        if end_frame > total:
+            raise MediaOperationError(f"结束帧不能超过动图总帧数 {total}")
+        keep_start = start_frame - 1
+        keep_end = end_frame
+        detail = f"已截取第 {start_frame} 至 {end_frame} 帧"
+    else:
+        keep_start = drop_first
+        keep_end = total - drop_last
+        actions: list[str] = []
+        if drop_first:
+            actions.append(f"移除前 {drop_first} 帧")
+        if drop_last:
+            actions.append(f"移除后 {drop_last} 帧")
+        if not actions:
+            raise MediaOperationError("请指定要移除的前帧、后帧或保留范围")
+        detail = "、".join(actions)
+
+    kept_count = keep_end - keep_start
+    if kept_count < 2:
+        raise MediaOperationError("截取后至少需要保留 2 帧动图")
+
+    output_count = min(kept_count, options.max_frames)
+    selected_indices = [
+        keep_start + index
+        for index in _sample_indices(kept_count, output_count)
+    ]
+    frames, durations, _ = _animation_frames(data, options, selected_indices)
+    output, reduced = encode_animation(frames, durations, options, "GIF")
+    sampling = f"，已从保留范围均匀采样为 {len(frames)} 帧" if len(frames) < kept_count else ""
+    suffix = "，已为控制体积自动压缩" if reduced else ""
+    return output, f"✅ {detail}（保留 {kept_count}/{total} 帧）{sampling}{suffix}"
+
+
+def _format_file_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KiB"
+    return f"{size / (1024 * 1024):.2f} MiB"
+
+
+def _format_duration(duration_ms: int) -> str:
+    if duration_ms < 1000:
+        return f"{duration_ms} ms"
+    if duration_ms < 60_000:
+        return f"{duration_ms / 1000:.2f} 秒"
+    minutes, milliseconds = divmod(duration_ms, 60_000)
+    return f"{minutes} 分 {milliseconds / 1000:.2f} 秒"
+
+
+def inspect_animation(data: bytes, duration_sample_limit: int = 5_000) -> str:
+    """Return safe, human-readable container and frame metadata for an image."""
+
+    if duration_sample_limit < 1:
+        raise MediaOperationError("信息读取的抽样帧数必须至少为 1")
+    image = _open_image(data)
+    try:
+        metadata = dict(image.info)
+        format_name = image.format or "未知"
+        width, height = image.size
+        total = max(1, int(getattr(image, "n_frames", 1)))
+        animated = bool(getattr(image, "is_animated", False) and total > 1)
+        sampled_indices = _sample_indices(total, min(total, duration_sample_limit))
+        durations: list[int] = []
+        for index in sampled_indices:
+            image.seek(index)
+            duration = int(image.info.get("duration", metadata.get("duration", 0)) or 0)
+            durations.append(max(0, duration))
+
+        loop = metadata.get("loop")
+        if loop is None:
+            loop_text = "未声明"
+        elif loop == 0:
+            loop_text = "无限循环"
+        else:
+            loop_text = f"{loop} 次"
+        has_transparency = "A" in image.getbands() or "transparency" in metadata
+        lines = [
+            "✅ 动图信息",
+            f"格式：{format_name}",
+            f"尺寸：{width}×{height} px",
+            f"文件大小：{_format_file_size(len(data))}",
+            f"颜色模式：{image.mode}",
+            f"透明度：{'有' if has_transparency else '无'}",
+            f"动画：{'是' if animated else '否'}",
+            f"帧数：{total}",
+            f"循环：{loop_text}",
+        ]
+        if "version" in metadata:
+            lines.append(f"容器版本：{metadata['version']}")
+        if durations:
+            average_duration = sum(durations) / len(durations)
+            duration_prefix = "帧时长" if len(durations) == total else f"帧时长（抽样 {len(durations)}/{total}）"
+            lines.append(
+                f"{duration_prefix}：{min(durations)} 到 {max(durations)} ms，平均 {average_duration:.1f} ms"
+            )
+            if len(durations) == total:
+                total_duration = sum(durations)
+                lines.append(f"总时长：{_format_duration(total_duration)}")
+                if total_duration > 0:
+                    lines.append(f"平均帧率：{total * 1000 / total_duration:.2f} FPS")
+        if "background" in metadata:
+            lines.append(f"背景索引：{metadata['background']}")
+        if "transparency" in metadata:
+            lines.append(f"透明色索引：{metadata['transparency']}")
+        if "dpi" in metadata:
+            dpi = metadata["dpi"]
+            if isinstance(dpi, tuple) and len(dpi) >= 2:
+                lines.append(f"DPI：{dpi[0]:g}×{dpi[1]:g}")
+        comment = metadata.get("comment")
+        if isinstance(comment, bytes):
+            lines.append(f"注释：{len(comment)} 字节")
+        elif isinstance(comment, str) and comment:
+            lines.append(f"注释：{len(comment.encode('utf-8'))} 字节")
+        if metadata:
+            lines.append("元数据键：" + "、".join(sorted(str(key) for key in metadata)))
+        return "\n".join(lines)
+    except EOFError as exc:
+        raise MediaOperationError("动画帧数据不完整") from exc
+    finally:
+        image.close()
 
 
 def _invert_rgba(image: Image.Image) -> Image.Image:

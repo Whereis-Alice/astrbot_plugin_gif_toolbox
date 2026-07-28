@@ -37,17 +37,19 @@ from .media_ops import (
     crop_grid,
     decompose_animation,
     image_to_line_art,
+    inspect_animation,
     make_single_image_gif,
     multi_image_to_gif,
     sprite_sheet_to_animation,
+    trim_animation,
     transform_image,
     video_to_animation,
 )
 
 
 PLUGIN_ID = "astrbot_plugin_gif_toolbox"
-PLUGIN_VERSION = "v2.2.0"
-PLUGIN_DESC = "独立 Fork 的 GIF/APNG/WebP 图片工具箱：可靠下载、变速、整体裁剪、合成、图像变换与单图转 GIF"
+PLUGIN_VERSION = "v2.3.0"
+PLUGIN_DESC = "独立 Fork 的 GIF/APNG/WebP 图片工具箱：可靠下载、变速、整体裁剪、帧截取、信息查看、合成与图像变换"
 FORK_REPO = "https://github.com/Whereis-Alice/astrbot_plugin_gif_toolbox"
 UPSTREAM_REPO = "https://github.com/shskjw/astrbot_plugin_gifcaijian"
 PIC_TOOLBOX_REPO = "https://github.com/lirundong093-glitch/astrbot_plugin_pic_toolbox"
@@ -76,6 +78,15 @@ class AnimationCropRequest:
     target_size: tuple[int, int] | None = None
     margins: tuple[int, int, int, int] | None = None
     anchor: str = "center"
+
+
+@dataclass(frozen=True)
+class AnimationTrimRequest:
+    """Validated frame-range operation parsed from a trim command."""
+
+    drop_first: int = 0
+    drop_last: int = 0
+    keep_range: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -659,6 +670,36 @@ class GifToolboxPlugin(Star):
         return AnimationCropRequest(margins=cls._parse_margins(text))
 
     @staticmethod
+    def _parse_animation_trim(text: str) -> AnimationTrimRequest:
+        """Parse leading/trailing frame removal or an inclusive frame range."""
+
+        range_match = re.search(
+            r"(?:第\s*)?(\d+)\s*(?:帧\s*)?(?:-|~|到|至)\s*(?:第\s*)?(\d+)\s*(?:帧)?",
+            text,
+        )
+        first_match = re.search(r"前(?:面)?\s*(\d+)\s*(?:帧)?", text)
+        last_match = re.search(r"后(?:面)?\s*(\d+)\s*(?:帧)?", text)
+        if range_match is not None:
+            if first_match is not None or last_match is not None:
+                raise MediaOperationError("保留帧范围不能和前后删帧同时使用")
+            start_frame, end_frame = (int(value) for value in range_match.groups())
+            if not 1 <= start_frame <= 1_000_000 or not 1 <= end_frame <= 1_000_000:
+                raise MediaOperationError("帧号必须在 1 到 1000000 之间")
+            if start_frame > end_frame:
+                raise MediaOperationError("起始帧不能大于结束帧")
+            return AnimationTrimRequest(keep_range=(start_frame, end_frame))
+
+        drop_first = int(first_match.group(1)) if first_match is not None else 0
+        drop_last = int(last_match.group(1)) if last_match is not None else 0
+        if (first_match is not None and not 1 <= drop_first <= 1_000_000) or (
+            last_match is not None and not 1 <= drop_last <= 1_000_000
+        ):
+            raise MediaOperationError("要移除的帧数必须在 1 到 1000000 之间")
+        if not drop_first and not drop_last:
+            raise MediaOperationError("请指定前后删帧，例如 前10帧、后10帧 或 10-60帧")
+        return AnimationTrimRequest(drop_first=drop_first, drop_last=drop_last)
+
+    @staticmethod
     def _parse_duration_ms(text: str, default_ms: int) -> int:
         fps_match = re.search(r"(\d+(?:\.\d+)?)\s*fps\b", text, re.IGNORECASE)
         if fps_match:
@@ -974,6 +1015,48 @@ class GifToolboxPlugin(Star):
             # also has a broad image-cropping handler.
             event.stop_event()
 
+    @filter.command("gif截取", alias={"动图截取"}, priority=10)
+    async def trim_animation_gif(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """按帧截取动图：gif截取 前10帧、后10帧或 10-60帧。"""
+
+        settings = self._settings()
+        try:
+            request = self._parse_animation_trim(event.message_str)
+            yield event.plain_result("⏳ 正在按帧截取动图...")
+            result, message = await asyncio.to_thread(
+                trim_animation,
+                await self._load_image(event, settings),
+                settings.media_options(),
+                drop_first=request.drop_first,
+                drop_last=request.drop_last,
+                keep_range=request.keep_range,
+            )
+            yield self._image_result(event, message, result)
+        except MediaOperationError as exc:
+            yield event.plain_result(f"❌ {exc}")
+        except Exception:
+            logger.exception("[%s] animation trim processing failed", PLUGIN_ID)
+            yield event.plain_result("❌ 动图截取失败，请稍后重试")
+        finally:
+            event.stop_event()
+
+    @filter.command("gif信息", alias={"动图信息", "gif详情"}, priority=10)
+    async def inspect_gif(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
+        """查看 GIF/APNG/WebP 的帧数、尺寸、时长、循环和文件元数据。"""
+
+        settings = self._settings()
+        try:
+            yield event.plain_result("⏳ 正在读取动图信息...")
+            message = await asyncio.to_thread(inspect_animation, await self._load_image(event, settings))
+            yield event.plain_result(message)
+        except MediaOperationError as exc:
+            yield event.plain_result(f"❌ {exc}")
+        except Exception:
+            logger.exception("[%s] animation info inspection failed", PLUGIN_ID)
+            yield event.plain_result("❌ 动图信息读取失败，请稍后重试")
+        finally:
+            event.stop_event()
+
     @filter.command("裁剪")
     async def crop_and_forward(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         """按网格裁剪图片：裁剪 2x3 边距 8。"""
@@ -1104,6 +1187,7 @@ class GifToolboxPlugin(Star):
             "• 左对称、右对称、上对称、下对称（均支持静态图和动图）\n"
             "• 合成1gif / 合成2gif [6x6] [0.1s] [边距 8]\n"
             "• gif裁剪 [比例 1:1 / 尺寸 512x512 / 边距 20]、裁剪 [2x3]\n"
+            "• gif截取 [前10帧 / 后10帧 / 10-60帧]、gif信息\n"
             "• 多图合成gif [0.5s]、gif分解\n"
             "• 图片转线稿、表情包做旧 [次数]、视频转gif [1s-4s fps 10 0.5]\n\n"
             f"这是 {UPSTREAM_REPO} 的独立 AGPL-3.0-or-later Fork；"

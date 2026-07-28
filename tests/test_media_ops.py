@@ -21,8 +21,10 @@ from astrbot_plugin_gif_toolbox.media_ops import (
     change_gif_speed,
     crop_animation,
     decompose_animation,
+    inspect_animation,
     make_single_image_gif,
     multi_image_to_gif,
+    trim_animation,
     transform_image,
 )
 
@@ -166,6 +168,107 @@ class MediaOperationTests(unittest.TestCase):
         with self.assertRaisesRegex(MediaOperationError, "位置"):
             crop_animation(source.getvalue(), self.options, aspect_ratio=(1, 1), anchor="unknown")
 
+    def test_animation_trim_removes_requested_frames_and_preserves_durations(self) -> None:
+        frames = [
+            Image.new("RGBA", (8, 8), (index * 40, 0, 0, 255))
+            for index in range(5)
+        ]
+        source = io.BytesIO()
+        frames[0].save(
+            source,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=[60, 80, 100, 120, 140],
+            loop=0,
+            disposal=2,
+        )
+
+        output, message = trim_animation(
+            source.getvalue(),
+            self.options,
+            drop_first=1,
+            drop_last=1,
+        )
+        self.assertIn("移除前 1 帧、移除后 1 帧", message)
+        self.assertIn("保留 3/5 帧", message)
+        with Image.open(io.BytesIO(output)) as image:
+            self.assertEqual(image.n_frames, 3)
+            for index, expected in enumerate(((40, 80), (80, 100), (120, 120))):
+                image.seek(index)
+                red, duration = expected
+                self.assertEqual(image.convert("RGBA").getpixel((0, 0)), (red, 0, 0, 255))
+                self.assertEqual(image.info["duration"], duration)
+
+        ranged, message = trim_animation(source.getvalue(), self.options, keep_range=(2, 4))
+        self.assertIn("第 2 至 4 帧", message)
+        with Image.open(io.BytesIO(ranged)) as image:
+            self.assertEqual(image.n_frames, 3)
+            image.seek(0)
+            self.assertEqual(image.convert("RGBA").getpixel((0, 0)), (40, 0, 0, 255))
+            image.seek(2)
+            self.assertEqual(image.convert("RGBA").getpixel((0, 0)), (120, 0, 0, 255))
+
+    def test_animation_trim_samples_only_after_the_kept_range(self) -> None:
+        frames = [
+            Image.new("RGBA", (8, 8), (index * 20, 0, 0, 255))
+            for index in range(8)
+        ]
+        source = io.BytesIO()
+        frames[0].save(
+            source,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=[100] * len(frames),
+            loop=0,
+            disposal=2,
+        )
+        limited = MediaOptions(max_side=256, max_frames=3, max_output_bytes=1024 * 1024)
+
+        output, message = trim_animation(source.getvalue(), limited, drop_first=2)
+        self.assertIn("均匀采样为 3 帧", message)
+        with Image.open(io.BytesIO(output)) as image:
+            self.assertEqual(image.n_frames, 3)
+            colors: list[int] = []
+            for index in range(image.n_frames):
+                image.seek(index)
+                colors.append(image.convert("RGBA").getpixel((0, 0))[0])
+            self.assertEqual(colors, [40, 80, 140])
+
+        with self.assertRaisesRegex(MediaOperationError, "至少需要保留 2 帧"):
+            trim_animation(source.getvalue(), self.options, drop_first=7)
+        with self.assertRaisesRegex(MediaOperationError, "结束帧"):
+            trim_animation(source.getvalue(), self.options, keep_range=(2, 9))
+
+    def test_animation_info_reports_frame_metadata(self) -> None:
+        frames = [
+            Image.new("RGBA", (12, 8), (255, 0, 0, 255)),
+            Image.new("RGBA", (12, 8), (0, 255, 0, 255)),
+            Image.new("RGBA", (12, 8), (0, 0, 255, 255)),
+        ]
+        source = io.BytesIO()
+        frames[0].save(
+            source,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=[100, 200, 300],
+            loop=0,
+            disposal=2,
+        )
+
+        info = inspect_animation(source.getvalue())
+        self.assertIn("格式：GIF", info)
+        self.assertIn("尺寸：12×8 px", info)
+        self.assertIn("帧数：3", info)
+        self.assertIn("循环：无限循环", info)
+        self.assertIn("总时长：600 ms", info)
+        self.assertIn("平均帧率：5.00 FPS", info)
+        static_info = inspect_animation(image_bytes((255, 0, 0, 255)))
+        self.assertIn("动画：否", static_info)
+        self.assertIn("帧数：1", static_info)
+
     def test_static_transforms_preserve_alpha_and_odd_sized_symmetry(self) -> None:
         source_image = Image.new("RGBA", (5, 1))
         for x, red in enumerate((10, 20, 30, 40, 50)):
@@ -298,6 +401,28 @@ class Event:
 
 
 class SourceResolutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_animation_trim_parser_supports_front_back_and_ranges(self) -> None:
+        plugin = GifToolboxPlugin(None, {})
+
+        removal = plugin._parse_animation_trim("gif截取 前10帧 后5帧")
+        self.assertEqual(removal.drop_first, 10)
+        self.assertEqual(removal.drop_last, 5)
+        self.assertIsNone(removal.keep_range)
+
+        frame_range = plugin._parse_animation_trim("gif截取 第12到第60帧")
+        self.assertEqual(frame_range.keep_range, (12, 60))
+        natural_range = plugin._parse_animation_trim("gif截取 第12帧到第60帧")
+        self.assertEqual(natural_range.keep_range, (12, 60))
+
+        with self.assertRaisesRegex(MediaOperationError, "请指定"):
+            plugin._parse_animation_trim("gif截取")
+        with self.assertRaisesRegex(MediaOperationError, "起始帧"):
+            plugin._parse_animation_trim("gif截取 60-12帧")
+        with self.assertRaisesRegex(MediaOperationError, "不能和前后"):
+            plugin._parse_animation_trim("gif截取 前10帧 20-60帧")
+        with self.assertRaisesRegex(MediaOperationError, "1 到 1000000"):
+            plugin._parse_animation_trim("gif截取 前0帧")
+
     async def test_animation_crop_parser_supports_ratio_size_margins_and_anchor(self) -> None:
         plugin = GifToolboxPlugin(None, {})
 
@@ -330,6 +455,25 @@ class SourceResolutionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(StopAsyncIteration):
             await anext(handler)
         self.assertTrue(event.stopped)
+
+    async def test_animation_trim_and_info_handlers_stop_later_matching_handlers(self) -> None:
+        plugin = GifToolboxPlugin(None, {})
+        trim_event = Event([], message_str="gif截取 前10帧")
+        trim_handler = plugin.trim_animation_gif(trim_event)
+
+        self.assertEqual(await anext(trim_handler), "⏳ 正在按帧截取动图...")
+        self.assertTrue((await anext(trim_handler)).startswith("❌ 未检测到图片"))
+        with self.assertRaises(StopAsyncIteration):
+            await anext(trim_handler)
+        self.assertTrue(trim_event.stopped)
+
+        info_event = Event([], message_str="gif信息")
+        info_handler = plugin.inspect_gif(info_event)
+        self.assertEqual(await anext(info_handler), "⏳ 正在读取动图信息...")
+        self.assertTrue((await anext(info_handler)).startswith("❌ 未检测到图片"))
+        with self.assertRaises(StopAsyncIteration):
+            await anext(info_handler)
+        self.assertTrue(info_event.stopped)
 
     async def test_transform_handler_stops_later_matching_handlers(self) -> None:
         plugin = GifToolboxPlugin(None, {})
