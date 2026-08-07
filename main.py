@@ -1,4 +1,4 @@
-"""AstrBot GIF Toolbox plugin entry point.
+"""AstrBot Alice GIF Toolbox plugin entry point.
 
 Copyright (C) 2026 Whereis-Alice and AstrBot Plugin Authors.
 Modified on 2026-07-18 from shskjw/astrbot_plugin_gifcaijian.
@@ -28,7 +28,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 import astrbot.api.message_components as Comp
 from astrbot.api.star import Context, Star, register
 
-from .help_card import HelpCardAssetError, load_help_card
+from .help_card import HelpCardAssetError, PLUGIN_DISPLAY_NAME, load_help_card
 from .media_ops import (
     MediaOperationError,
     MediaOptions,
@@ -50,8 +50,8 @@ from .media_ops import (
 
 
 PLUGIN_ID = "astrbot_plugin_gif_toolbox"
-PLUGIN_VERSION = "v2.5.1"
-PLUGIN_DESC = "独立 Fork 的 GIF/APNG/WebP 图片工具箱：可靠下载、变速、倒放、裁剪、信息查看、图片速查、合成与图像变换"
+PLUGIN_VERSION = "v2.5.2"
+PLUGIN_DESC = f"{PLUGIN_DISPLAY_NAME}（独立 Fork）：支持 GIF/APNG/WebP 变速、倒放、裁剪、信息查看、速查、合成与图像变换"
 FORK_REPO = "https://github.com/Whereis-Alice/astrbot_plugin_gif_toolbox"
 UPSTREAM_REPO = "https://github.com/shskjw/astrbot_plugin_gifcaijian"
 PIC_TOOLBOX_REPO = "https://github.com/lirundong093-glitch/astrbot_plugin_pic_toolbox"
@@ -123,7 +123,7 @@ class RuntimeSettings:
 
 @register(PLUGIN_ID, "Whereis-Alice (fork of shskjw)", PLUGIN_DESC, PLUGIN_VERSION, FORK_REPO)
 class GifToolboxPlugin(Star):
-    """GIF utility commands with AstrBot 4.16+ image-source compatibility."""
+    """Alice's GIF Toolbox commands with AstrBot 4.16+ source compatibility."""
 
     def __init__(self, context: Context, config: AstrBotConfig | dict[str, Any] | None = None) -> None:
         super().__init__(context, config)
@@ -442,7 +442,7 @@ class GifToolboxPlugin(Star):
     async def _download_http(self, reference: str, settings: RuntimeSettings) -> bytes:
         timeout = aiohttp.ClientTimeout(total=settings.timeout_seconds)
         headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; AstrBot GIF Toolbox)",
+            "User-Agent": "Mozilla/5.0 (compatible; AstrBot Alice GIF Toolbox)",
             "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         }
         try:
@@ -1101,7 +1101,7 @@ class GifToolboxPlugin(Star):
             )
             nodes = [
                 Comp.Node(
-                    name="GIF 工具箱",
+                    name=PLUGIN_DISPLAY_NAME,
                     content=[Comp.Plain(f"裁剪结果 {index + 1}/{len(parts)}"), Comp.Image.fromBytes(part)],
                 )
                 for index, part in enumerate(parts)
@@ -1127,7 +1127,7 @@ class GifToolboxPlugin(Star):
             )
             nodes = [
                 Comp.Node(
-                    name="GIF 工具箱",
+                    name=PLUGIN_DISPLAY_NAME,
                     content=[Comp.Plain(f"第 {index + 1} 帧"), Comp.Image.fromBytes(frame)],
                 )
                 for index, frame in enumerate(frames)
@@ -1198,13 +1198,17 @@ class GifToolboxPlugin(Star):
                 except OSError:
                     logger.warning("[%s] could not remove temporary video %s", PLUGIN_ID, path)
 
-    @filter.command("gif工具箱帮助", alias={"gif速查", "动图速查"}, priority=10)
+    @filter.command(
+        "爱丽丝的GIF工具箱帮助",
+        alias={"gif工具箱帮助", "gif速查", "动图速查"},
+        priority=10,
+    )
     async def gif_toolbox_help(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         """发送包含全部命令、别名与关键参数的 PNG 速查图。"""
 
         try:
             card = await asyncio.to_thread(load_help_card)
-            yield self._image_result(event, "GIF 工具箱命令速查", card)
+            yield self._image_result(event, f"{PLUGIN_DISPLAY_NAME}命令速查", card)
         except HelpCardAssetError:
             logger.exception("[%s] packaged help card is unavailable", PLUGIN_ID)
             yield event.plain_result("❌ 命令速查图片不可用，请查看插件 README")

@@ -16,7 +16,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import astrbot.api.message_components as Comp
 
 from astrbot_plugin_gif_toolbox.main import GifToolboxPlugin
-from astrbot_plugin_gif_toolbox.help_card import HELP_CARD_COMMANDS, HELP_CARD_SECTIONS, load_help_card
+from astrbot_plugin_gif_toolbox.help_card import (
+    HELP_CARD_COMMANDS,
+    HELP_CARD_SECTIONS,
+    PLUGIN_DISPLAY_NAME,
+    load_help_card,
+)
 from astrbot_plugin_gif_toolbox.media_ops import (
     MediaOperationError,
     MediaOptions,
@@ -490,8 +495,10 @@ class Event:
 class SourceResolutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_help_card_covers_registered_commands_and_handler_returns_png(self) -> None:
         source = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
-        registered_commands = set(re.findall(r'@filter\.command\("([^"]+)"', source))
+        registered_commands = set(re.findall(r'@filter\.command\(\s*"([^"]+)"', source))
         self.assertEqual(registered_commands, HELP_CARD_COMMANDS)
+        self.assertIn("爱丽丝的GIF工具箱帮助", registered_commands)
+        self.assertIn('"gif工具箱帮助"', source)
         card_source = "\n".join(
             f"{entry.command}\n{entry.detail}"
             for section in HELP_CARD_SECTIONS
@@ -504,6 +511,7 @@ class SourceResolutionTests(unittest.IsolatedAsyncioTestCase):
         for command in registered_commands:
             self.assertIn(f"/{command}", readme)
         self.assertIn("shskjw/astrbot_plugin_gifcaijian", readme)
+        self.assertIn(PLUGIN_DISPLAY_NAME, readme)
 
         card = load_help_card()
         self.assertTrue(card.startswith(b"\x89PNG\r\n\x1a\n"))
@@ -517,7 +525,7 @@ class SourceResolutionTests(unittest.IsolatedAsyncioTestCase):
         event = Event([])
         handler = plugin.gif_toolbox_help(event)
         result = await anext(handler)
-        self.assertEqual(result[0].text, "GIF 工具箱命令速查")
+        self.assertEqual(result[0].text, f"{PLUGIN_DISPLAY_NAME}命令速查")
         self.assertTrue(result[1].file.startswith("base64://"))
         with self.assertRaises(StopAsyncIteration):
             await anext(handler)

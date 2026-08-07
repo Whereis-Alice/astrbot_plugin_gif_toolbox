@@ -9,6 +9,7 @@ from typing import Final
 
 PNG_SIGNATURE: Final = b"\x89PNG\r\n\x1a\n"
 HELP_CARD_PATH: Final = Path(__file__).with_name("assets") / "gif_toolbox_help.png"
+PLUGIN_DISPLAY_NAME: Final = "爱丽丝的GIF工具箱"
 
 
 @dataclass(frozen=True)
@@ -125,8 +126,8 @@ HELP_CARD_SECTIONS: Final = (
                 "回复或附带视频。示例：/视频转gif 1s-4s fps 10 0.5。",
             ),
             HelpCardEntry(
-                "/gif工具箱帮助",
-                "别名：/gif速查、/动图速查。直接发送本张完整指令速查图。",
+                "/爱丽丝的GIF工具箱帮助",
+                "兼容别名：/gif工具箱帮助、/gif速查、/动图速查。直接发送本张完整指令速查图。",
             ),
         ),
     ),
@@ -171,7 +172,7 @@ HELP_CARD_COMMANDS: Final = frozenset(
         "gif分解",
         "表情包做旧",
         "视频转gif",
-        "gif工具箱帮助",
+        "爱丽丝的GIF工具箱帮助",
     }
 )
 

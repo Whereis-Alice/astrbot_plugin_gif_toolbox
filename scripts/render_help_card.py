@@ -18,6 +18,7 @@ from help_card import (
     HELP_CARD_FOOTER,
     HELP_CARD_PATH,
     HELP_CARD_SECTIONS,
+    PLUGIN_DISPLAY_NAME,
     HelpCardEntry,
     HelpCardSection,
 )
@@ -191,7 +192,7 @@ def main() -> None:
     draw = ImageDraw.Draw(image)
     draw.rectangle((0, 0, CANVAS_WIDTH, 300), fill=HEADER)
     draw.rectangle((PAGE_MARGIN, 54, PAGE_MARGIN + 142, 62), fill=HEADER_ACCENT)
-    draw.text((PAGE_MARGIN, 88), "GIF 工具箱", font=title_font, fill="#FFFFFF")
+    draw.text((PAGE_MARGIN, 88), PLUGIN_DISPLAY_NAME, font=title_font, fill="#FFFFFF")
     draw.text(
         (PAGE_MARGIN, 184),
         f"命令速查 · 全部 {len(HELP_CARD_COMMANDS)} 个指令、别名与关键参数",
@@ -228,7 +229,7 @@ def main() -> None:
         section_font,
         detail_font,
     )
-    footnote = "astrbot_plugin_gif_toolbox · 独立 Fork · 详细参数以 README 为准"
+    footnote = f"{PLUGIN_DISPLAY_NAME} · 独立 Fork · 详细参数以 README 为准"
     draw.text((PAGE_MARGIN, footer_bottom + 38), footnote, font=eyebrow_font, fill="#65757F")
     final_height = footer_bottom + 92
 

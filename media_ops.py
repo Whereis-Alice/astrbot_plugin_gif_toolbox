@@ -1,4 +1,4 @@
-"""CPU-bound image and animation operations for GIF Toolbox.
+"""CPU-bound image and animation operations for Alice's GIF Toolbox.
 
 Copyright (C) 2026 Whereis-Alice and AstrBot Plugin Authors.
 This file is a modified work based on shskjw/astrbot_plugin_gifcaijian and
